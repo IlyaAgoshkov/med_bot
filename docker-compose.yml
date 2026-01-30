@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  med_bot:
+    build: .
+    container_name: med_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS:-}
+      - DB_DIR=/app/data
+    volumes:
+      # Монтируем директорию для базы данных (чтобы данные сохранялись при перезапуске)
+      - ./data:/app/data
+    networks:
+      - med_bot_network
+
+networks:
+  med_bot_network:
+    driver: bridge
