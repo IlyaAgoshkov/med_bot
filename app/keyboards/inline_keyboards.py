@@ -43,8 +43,9 @@ def get_financial_stability_keyboard() -> InlineKeyboardMarkup:
 def get_night_shifts_rate_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура ставки ночных дежурств"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="> 1 ставки", callback_data="shift_more")],
-        [InlineKeyboardButton(text="< 1 ставки", callback_data="shift_less")]
+        [InlineKeyboardButton(text=">= 1 ставки", callback_data="shift_more")],
+        [InlineKeyboardButton(text="= 1 ставки", callback_data="shift_equal")],
+        [InlineKeyboardButton(text="<= 1 ставки", callback_data="shift_less")]
     ])
     return keyboard
 
@@ -147,6 +148,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура админ-панели"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📥 Выгрузить результаты", callback_data="admin_export")]
     ])
     return keyboard

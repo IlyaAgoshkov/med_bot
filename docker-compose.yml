@@ -14,6 +14,8 @@ services:
     volumes:
       # Монтируем директорию для базы данных (чтобы данные сохранялись при перезапуске)
       - ./data:/app/data
+      # Монтируем директорию с файлами (PDF)
+      - ./file:/app/file
     networks:
       - med_bot_network
 

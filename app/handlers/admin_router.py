@@ -1,11 +1,21 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from app.database.db import get_db_path
 from app.filters.admin_filter import IsAdminFilter
-from app.keyboards.inline_keyboards import get_admin_keyboard
+from app.keyboards.inline_keyboards import get_admin_keyboard, get_gift_keyboard
+from app.states.survey_states import SurveyStates
 import aiosqlite
+import openpyxl
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+import tempfile
+import os
+import logging
+from datetime import datetime
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
@@ -128,3 +138,362 @@ async def admin_users(callback: CallbackQuery):
     
     await callback.message.edit_text(users_text, reply_markup=get_admin_keyboard())
     await callback.answer()
+
+
+async def generate_excel_export() -> str:
+    """Генерация Excel файла с результатами опросов (без персональных данных)"""
+    logger.info("Начало генерации Excel файла")
+    
+    # Создаем временный файл
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+    temp_file.close()
+    logger.info(f"Создан временный файл: {temp_file.name}")
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Результаты опросов"
+    
+    # Заголовки
+    headers = [
+        "ID опроса",
+        "Возраст",
+        "Пол",
+        "Рост (см)",
+        "Вес (кг)",
+        "ИМТ",
+        "Образование",
+        "Финансовая стабильность",
+        "Курение",
+        "Алкоголь (раз/неделю)",
+        "Соль (г/день)",
+        "Другие вредные привычки",
+        "Время за экраном (ч/день)",
+        "Физическая активность",
+        "Ночные дежурства",
+        "Ставка ночных дежурств",
+        "Хронические заболевания",
+        "Лекарства постоянно",
+        "Семейный анамнез",
+        "Уровень стресса (1-10)",
+        "Качество сна (1-10)",
+        "PHQ-2 балл",
+        "PHQ-9 балл",
+        "АД1 систолическое",
+        "АД1 диастолическое",
+        "АД1 время",
+        "АД2 систолическое",
+        "АД2 диастолическое",
+        "АД2 время",
+        "АД3 систолическое",
+        "АД3 диастолическое",
+        "АД3 время",
+        "Среднее АД систолическое",
+        "Среднее АД диастолическое",
+        "Источник информации",
+        "Балл риска",
+        "Уровень риска",
+        "Дата прохождения"
+    ]
+    
+    # Записываем заголовки
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    
+    # Получаем данные из БД
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("""
+            SELECT 
+                id,
+                age, gender, height, weight, bmi,
+                education, financial_stability,
+                smoking, alcohol_per_week, salt_per_day, other_habits,
+                screen_time, physical_activity,
+                night_shifts, night_shifts_rate,
+                chronic_diseases, medications, family_history,
+                stress_level, sleep_quality,
+                phq2_score, phq9_score,
+                bp1_systolic, bp1_diastolic, bp1_time,
+                bp2_systolic, bp2_diastolic, bp2_time,
+                bp3_systolic, bp3_diastolic, bp3_time,
+                referral_source, risk_score, risk_level,
+                completed_at
+            FROM surveys
+            ORDER BY completed_at DESC
+        """) as cursor:
+            rows = await cursor.fetchall()
+    
+    logger.info(f"Получено {len(rows)} записей из базы данных")
+    
+    # Записываем данные
+    if not rows:
+        logger.warning("Нет данных для записи в Excel")
+        wb.save(temp_file.name)
+        return temp_file.name
+    
+    for row_idx, row in enumerate(rows, 2):
+        # Вычисляем среднее АД (индексы: 23=bp1_sys, 24=bp1_dia, 26=bp2_sys, 27=bp2_dia, 29=bp3_sys, 30=bp3_dia)
+        bp1_sys, bp1_dia = row[23], row[24]
+        bp2_sys, bp2_dia = row[26], row[27]
+        bp3_sys, bp3_dia = row[29], row[30]
+        
+        avg_sys = None
+        avg_dia = None
+        if bp1_sys and bp2_sys and bp3_sys:
+            avg_sys = (bp1_sys + bp2_sys + bp3_sys) // 3
+        if bp1_dia and bp2_dia and bp3_dia:
+            avg_dia = (bp1_dia + bp2_dia + bp3_dia) // 3
+        
+        # Формируем строку данных
+        data_row = [
+            row[0],  # ID опроса
+            row[1] if row[1] else "",  # Возраст
+            row[2] if row[2] else "",  # Пол
+            row[3] if row[3] else "",  # Рост
+            row[4] if row[4] else "",  # Вес
+            round(row[5], 2) if row[5] else "",  # ИМТ
+            row[6] if row[6] else "",  # Образование
+            row[7] if row[7] else "",  # Финансовая стабильность
+            "Да" if row[8] else "Нет",  # Курение
+            row[9] if row[9] is not None else 0,  # Алкоголь
+            round(row[10], 1) if row[10] else "",  # Соль
+            "Да" if row[11] else "Нет",  # Другие привычки
+            row[12] if row[12] else "",  # Время за экраном
+            "Да" if row[13] else "Нет",  # Физическая активность
+            "Да" if row[14] else "Нет",  # Ночные дежурства
+            row[15] if row[15] else "",  # Ставка
+            row[16] if row[16] else "",  # Хронические заболевания
+            "Да" if row[17] else "Нет",  # Лекарства
+            "Да" if row[18] else "Нет",  # Семейный анамнез
+            row[19] if row[19] else "",  # Стресс
+            row[20] if row[20] else "",  # Сон
+            row[21] if row[21] else 0,  # PHQ-2
+            row[22] if row[22] else 0,  # PHQ-9
+            row[23] if row[23] else "",  # АД1 сист
+            row[24] if row[24] else "",  # АД1 диаст
+            row[25] if row[25] else "",  # АД1 время
+            row[26] if row[26] else "",  # АД2 сист
+            row[27] if row[27] else "",  # АД2 диаст
+            row[28] if row[28] else "",  # АД2 время
+            row[29] if row[29] else "",  # АД3 сист
+            row[30] if row[30] else "",  # АД3 диаст
+            row[31] if row[31] else "",  # АД3 время
+            avg_sys if avg_sys else "",  # Среднее АД сист
+            avg_dia if avg_dia else "",  # Среднее АД диаст
+            row[32] if row[32] else "",  # Источник
+            row[33] if row[33] else "",  # Балл риска
+            row[34] if row[34] else "",  # Уровень риска
+            row[35] if row[35] else ""  # Дата
+        ]
+        
+        for col, value in enumerate(data_row, 1):
+            ws.cell(row=row_idx, column=col, value=value)
+    
+    # Настраиваем ширину колонок
+    for col in range(1, len(headers) + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 20
+    
+    # Сохраняем файл
+    try:
+        wb.save(temp_file.name)
+        logger.info(f"Excel файл успешно сохранен: {temp_file.name}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении Excel файла: {e}", exc_info=True)
+        raise
+    
+    return temp_file.name
+
+
+@router.callback_query(F.data == "admin_export", IsAdminFilter())
+async def admin_export(callback: CallbackQuery):
+    """Выгрузка результатов опросов в Excel"""
+    await callback.answer("⏳ Проверяю данные...")
+    
+    # Сначала проверяем, есть ли данные
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("SELECT COUNT(*) FROM surveys") as cursor:
+            count_row = await cursor.fetchone()
+            survey_count = count_row[0] if count_row else 0
+    
+    if survey_count == 0:
+        await callback.message.answer("ℹ️ <b>Пока никто не проходил тест</b>\n\nРезультаты появятся здесь после того, как пользователи пройдут опрос.")
+        await callback.answer()
+        return
+    
+    await callback.answer("⏳ Генерирую файл...")
+    
+    try:
+        logger.info("Начало генерации Excel файла для админа")
+        # Генерируем Excel файл
+        file_path = await generate_excel_export()
+        
+        if not os.path.exists(file_path):
+            logger.error(f"Файл не был создан: {file_path}")
+            await callback.answer("❌ Ошибка: файл не был создан", show_alert=True)
+            return
+        
+        logger.info(f"Отправка файла админу: {file_path}")
+        # Отправляем файл
+        file = FSInputFile(file_path, filename=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        await callback.message.answer_document(
+            document=file,
+            caption="📥 <b>Результаты опросов</b>\n\nФайл содержит все ответы и результаты без персональных данных."
+        )
+        
+        logger.info("Файл успешно отправлен админу")
+        
+        # Удаляем временный файл
+        try:
+            os.unlink(file_path)
+            logger.info(f"Временный файл удален: {file_path}")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить временный файл {file_path}: {e}")
+        
+        await callback.answer("✅ Файл успешно сгенерирован")
+    except Exception as e:
+            await callback.answer("❌ Ошибка при генерации файла", show_alert=True)
+            logger.error(f"Ошибка при генерации Excel файла: {e}", exc_info=True)
+
+
+@router.message(Command("test_gift"), IsAdminFilter())
+async def cmd_test_gift(message: Message):
+    """Команда для тестирования выбора подарка и генерации реферальной ссылки"""
+    user_id = message.from_user.id
+    
+    # Проверяем, существует ли пользователь в БД
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user_exists = await cursor.fetchone()
+        
+        if not user_exists:
+            # Создаем пользователя, если его нет
+            from app.utils.referral import generate_referral_code
+            ref_code = generate_referral_code(user_id)
+            await db.execute(
+                "INSERT INTO users (user_id, username, full_name, referral_code) VALUES (?, ?, ?, ?)",
+                (user_id, message.from_user.username or "Admin", message.from_user.full_name or "Admin", ref_code)
+            )
+            await db.commit()
+            logger.info(f"Создан пользователь {user_id} для тестирования")
+    
+    gift_text = """🎁 <b>Тестирование реферальной системы</b>
+
+Выберите подарок для генерации реферальной ссылки:"""
+    
+    sent_message = await message.answer(gift_text, reply_markup=get_gift_keyboard())
+    
+    # Сохраняем ID сообщения для проверки в обработчике
+    # Можно использовать состояние или просто проверить, что это админ
+
+
+@router.callback_query(F.data.startswith("gift_"), IsAdminFilter())
+async def admin_process_gift_choice(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора подарка для админа (тестирование)"""
+    # Проверяем, что пользователь НЕ в состоянии waiting_gift_choice (чтобы не конфликтовать с основным обработчиком)
+    current_state = await state.get_state()
+    if current_state == SurveyStates.waiting_gift_choice:
+        # Если админ в состоянии waiting_gift_choice, пропускаем этот обработчик
+        # Основной обработчик в survey_router обработает это
+        return
+    
+    gift_map = {
+        "gift_nutrition": "Питание",
+        "gift_activity": "Физическая активность",
+        "gift_stress": "Стресс"
+    }
+    gift_type = gift_map.get(callback.data)
+    
+    if not gift_type:
+        await callback.answer("❌ Неизвестный подарок", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    
+    # Сохраняем предпочтение подарка
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute(
+            "UPDATE users SET preferred_gift = ? WHERE user_id = ?",
+            (gift_type, user_id)
+        )
+        await db.commit()
+    
+    # Генерируем реферальную ссылку
+    bot_username = (await callback.message.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
+    
+    result_text = f"""✅ <b>Подарок выбран!</b>
+
+Вы выбрали подарок: <b>{gift_type}</b>
+
+🔗 <b>Ваша реферальная ссылка:</b>
+<code>{ref_link}</code>
+
+📋 <b>Для тестирования:</b>
+1. Скопируйте ссылку
+2. Откройте её в другом аккаунте (или попросите друга)
+3. Пройдите тест
+4. После завершения теста вы получите подарок!
+
+Или используйте команду /test_complete для симуляции прохождения теста."""
+    
+    await callback.message.edit_text(result_text)
+    await callback.answer(f"✅ Выбрано: {gift_type}")
+
+
+@router.message(Command("test_complete"), IsAdminFilter())
+async def cmd_test_complete(message: Message):
+    """Команда для симуляции прохождения теста (создает запись в surveys)"""
+    user_id = message.from_user.id
+    
+    # Проверяем, существует ли пользователь в БД
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user_exists = await cursor.fetchone()
+        
+        if not user_exists:
+            await message.answer("❌ Пользователь не найден в БД. Сначала используйте /test_gift для создания пользователя.")
+            return
+        
+        # Проверяем, есть ли уже запись о прохождении теста
+        async with db.execute("SELECT id FROM surveys WHERE user_id = ?", (user_id,)) as cursor:
+            survey_exists = await cursor.fetchone()
+        
+        if survey_exists:
+            # Обновляем существующую запись
+            await db.execute("""
+                UPDATE surveys 
+                SET completed_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            """, (user_id,))
+            await db.commit()
+            await message.answer("✅ Запись о прохождении теста обновлена (время изменено на текущее)")
+        else:
+            # Создаем новую запись с минимальными данными для тестирования
+            await db.execute("""
+                INSERT INTO surveys (
+                    user_id, consent, age, gender, height, weight, bmi, 
+                    education, financial_stability, smoking, alcohol_per_week, 
+                    salt_per_day, other_habits, screen_time, physical_activity,
+                    night_shifts, night_shifts_rate, chronic_diseases, medications, 
+                    family_history, stress_level, sleep_quality, phq2_score, phq9_score,
+                    bp1_systolic, bp1_diastolic, bp1_time,
+                    bp2_systolic, bp2_diastolic, bp2_time,
+                    bp3_systolic, bp3_diastolic, bp3_time,
+                    referral_source, risk_level, risk_score
+                ) VALUES (?, 1, 30, 'мужской', 175, 75, 24.5, 
+                    'Высшее', 'Средняя', 0, 0, 5.0, 0, 4, 1,
+                    0, NULL, 'нет', 0, 0, 5, 7, 0, 0,
+                    120, 80, '12:00',
+                    125, 82, '16:00',
+                    118, 78, '20:00',
+                    'Другое', 'низкий', 5)
+            """, (user_id,))
+            await db.commit()
+            await message.answer("✅ Создана запись о прохождении теста (тестовые данные)")
+        
+        # Проверяем, был ли пользователь приглашен, и отправляем подарок рефереру
+        from app.handlers.survey_router import send_gift_to_referrer
+        await send_gift_to_referrer(message.bot, user_id)
+        
+        await message.answer("✅ Тест пройден! Проверьте, был ли отправлен подарок рефереру (если он был указан).")

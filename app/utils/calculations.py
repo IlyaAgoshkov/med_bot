@@ -66,7 +66,7 @@ def calculate_risk_score(survey_data: Dict) -> int:
         night_shifts_rate = survey_data.get("night_shifts_rate", "")
         if night_shifts_rate == "> 1 ставки":
             score += 1  # > 1 ставки - 1 балл
-        # < 1 ставки - 0 баллов
+        # < 1 ставки и = 1 ставки - 0 баллов
     
     # 12. Второе измерение АД - 0 баллов (категория определяется отдельно)
     

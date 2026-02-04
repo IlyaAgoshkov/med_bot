@@ -1,8 +1,10 @@
 import re
+import asyncio
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command, StateFilter
+import os
 
 from app.states.survey_states import SurveyStates
 from app.keyboards.inline_keyboards import (
@@ -16,7 +18,6 @@ from app.keyboards.inline_keyboards import (
     get_referral_source_keyboard,
     get_gift_keyboard,
     get_main_menu_keyboard,
-    get_cancel_keyboard,
     get_invite_friend_keyboard,
     get_start_keyboard,
     get_restart_survey_keyboard
@@ -35,10 +36,108 @@ router = Router()
 survey_data = {}
 
 
+async def send_gift_to_referrer(bot, user_id: int):
+    """Отправить подарок рефереру, если приглашенный пользователь прошел тест"""
+    logger.info(f"🔍 Проверка реферера для пользователя {user_id}")
+    
+    async with aiosqlite.connect(get_db_path()) as db:
+        # Проверяем, был ли пользователь приглашен (проверяем и referred_by, и таблицу referrals)
+        referrer_id = None
+        
+        # Сначала проверяем таблицу referrals (это более надежный способ)
+        async with db.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id = ?",
+            (user_id,)
+        ) as cursor:
+            referral_row = await cursor.fetchone()
+            if referral_row and referral_row[0]:
+                referrer_id = referral_row[0]
+                logger.info(f"✅ Найден реферер через referrals: {referrer_id}")
+        
+        # Если не нашли через referrals, проверяем поле referred_by в таблице users
+        if not referrer_id:
+            async with db.execute(
+                "SELECT referred_by FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                user_row = await cursor.fetchone()
+                if user_row and user_row[0]:
+                    referrer_id = user_row[0]
+                    logger.info(f"✅ Найден реферер через referred_by: {referrer_id}")
+                elif user_row:
+                    logger.info(f"Пользователь {user_id} найден в БД, но referred_by = None")
+                else:
+                    logger.warning(f"⚠️ Пользователь {user_id} не найден в таблице users")
+        
+        if not referrer_id:
+            logger.info(f"❌ Пользователь {user_id} не был приглашен, подарок не отправляется")
+            return  # Пользователь не был приглашен
+        
+        # Получаем информацию о реферере и его предпочтении подарка
+        async with db.execute(
+            "SELECT preferred_gift FROM users WHERE user_id = ?",
+            (referrer_id,)
+        ) as cursor:
+            referrer_row = await cursor.fetchone()
+            if not referrer_row or not referrer_row[0]:
+                logger.info(f"Реферер {referrer_id} не выбрал подарок, файл не отправляется")
+                return
+            
+            preferred_gift = referrer_row[0]
+            logger.info(f"Реферер {referrer_id} выбрал подарок: {preferred_gift}")
+        
+        # Маппинг подарков на файлы
+        gift_file_map = {
+            "Питание": "Питание.pdf",
+            "Физическая активность": "Физическая активность.pdf",
+            "Стресс": "Стресс.pdf"
+        }
+        
+        file_name = gift_file_map.get(preferred_gift)
+        if not file_name:
+            logger.warning(f"Неизвестный подарок: {preferred_gift}")
+            return
+        
+        # Отправляем файл рефереру
+        gift_file_path = os.path.join("file", file_name)
+        logger.info(f"Попытка отправить файл: {gift_file_path}")
+        
+        if os.path.exists(gift_file_path):
+            try:
+                gift_file = FSInputFile(gift_file_path, filename=file_name)
+                gift_text = f"🎁 <b>Поздравляем!</b>\n\nКто-то прошел тест по вашей реферальной ссылке!\n\nВаш подарок: <b>{preferred_gift}</b>"
+                
+                # Пытаемся отправить файл с увеличенным таймаутом и повторными попытками
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        await bot.send_document(
+                            chat_id=referrer_id,
+                            document=gift_file,
+                            caption=gift_text,
+                            request_timeout=60  # Увеличиваем таймаут до 60 секунд
+                        )
+                        logger.info(f"✅ Подарок {preferred_gift} успешно отправлен рефереру {referrer_id}")
+                        break  # Успешно отправлено, выходим из цикла
+                    except Exception as retry_error:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️ Попытка {attempt + 1}/{max_retries} не удалась при отправке подарка рефереру {referrer_id}: {retry_error}. Повторная попытка...")
+                            await asyncio.sleep(2)  # Ждем 2 секунды перед повторной попыткой
+                        else:
+                            raise  # Если все попытки исчерпаны, пробрасываем исключение
+            except Exception as e:
+                logger.error(f"❌ Ошибка при отправке подарка рефереру {referrer_id} после {max_retries} попыток: {e}", exc_info=True)
+        else:
+            logger.error(f"❌ Файл подарка не найден: {gift_file_path}")
+
+
 async def notify_admins_about_survey(bot, user_id: int):
     """Уведомить админов о прохождении теста пользователем"""
     if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS пуст, уведомления не отправляются")
         return
+    
+    logger.info(f"Отправка уведомления админам о прохождении теста пользователем {user_id}")
     
     async with aiosqlite.connect(get_db_path()) as db:
         # Получаем информацию о пользователе
@@ -48,9 +147,24 @@ async def notify_admins_about_survey(bot, user_id: int):
         ) as cursor:
             user_row = await cursor.fetchone()
             if not user_row:
-                return
-            user_full_name = user_row[0] or "Не указано"
-            user_username = user_row[1] or "Не указано"
+                logger.error(f"Пользователь {user_id} не найден в БД, уведомление не отправляется")
+                # Попробуем создать пользователя с минимальной информацией
+                try:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO users (user_id, username, full_name, referral_code) VALUES (?, ?, ?, ?)",
+                        (user_id, "Не указано", "Не указано", generate_referral_code(user_id))
+                    )
+                    await db.commit()
+                    logger.info(f"Создан пользователь {user_id} в БД для уведомления")
+                    user_full_name = "Не указано"
+                    user_username = "Не указано"
+                except Exception as e:
+                    logger.error(f"Не удалось создать пользователя {user_id}: {e}", exc_info=True)
+                    return
+            else:
+                user_full_name = user_row[0] or "Не указано"
+                user_username = user_row[1] or "Не указано"
+                logger.info(f"Найден пользователь: {user_full_name} (@{user_username})")
         
         # Проверяем, был ли пользователь приглашен
         async with db.execute(
@@ -59,6 +173,16 @@ async def notify_admins_about_survey(bot, user_id: int):
         ) as cursor:
             referral_row = await cursor.fetchone()
             referrer_id = referral_row[0] if referral_row else None
+        
+        # Формируем уведомление
+        notification_text = f"""🔔 <b>Новое уведомление</b>
+
+<b>Пользователь</b>
+Имя: {user_full_name}
+Username: @{user_username}
+ID: {user_id}
+
+прошел опрос"""
         
         # Если был приглашен, получаем информацию о реферере
         if referrer_id:
@@ -71,14 +195,7 @@ async def notify_admins_about_survey(bot, user_id: int):
                 referrer_username = referrer_row[1] if referrer_row else "Не указано"
                 preferred_gift = referrer_row[2] if referrer_row and referrer_row[2] else "Не указан"
             
-            notification_text = f"""🔔 <b>Новое уведомление</b>
-
-<b>Пользователь</b>
-Имя: {user_full_name}
-Username: @{user_username}
-ID: {user_id}
-
-прошел опрос
+            notification_text += f"""
 
 <b>Его пригласил:</b>
 Имя: {referrer_full_name}
@@ -87,75 +204,19 @@ ID: {referrer_id}
 
 <b>Ему нужно подарить:</b> {preferred_gift}"""
         else:
-            notification_text = f"""🔔 <b>Новое уведомление</b>
+            notification_text += f"""
 
-<b>Пользователь</b>
-Имя: {user_full_name}
-Username: @{user_username}
-ID: {user_id}
-
-прошел опрос
-
-<i>Не был приглашен</i>"""
+<b>Его пригласил:</b> —"""
     
     # Отправляем уведомление всем админам
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, notification_text)
+            logger.info(f"Уведомление успешно отправлено админу {admin_id}")
         except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}", exc_info=True)
 
 
-async def update_or_send_message(bot, chat_id, message_id, text, reply_markup=None, state=None):
-    """Обновить сообщение или отправить новое, если обновление невозможно"""
-    try:
-        if message_id:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=reply_markup
-            )
-            return message_id
-    except Exception:
-        pass
-    
-    # Если не удалось обновить, отправляем новое
-    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    if state:
-        await state.update_data(current_message_id=sent.message_id)
-    return sent.message_id
-
-
-async def delete_user_message(message: Message):
-    """Удалить сообщение пользователя"""
-    try:
-        await message.delete()
-    except Exception:
-        pass  # Игнорируем ошибки удаления
-
-
-async def update_bot_message(message: Message, state: FSMContext, text: str, reply_markup=None):
-    """Обновить сообщение бота или отправить новое"""
-    data = await state.get_data()
-    current_message_id = data.get("current_message_id")
-    
-    if current_message_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=current_message_id,
-                text=text,
-                reply_markup=reply_markup
-            )
-            return current_message_id
-        except Exception:
-            pass
-    
-    # Если не удалось обновить, отправляем новое
-    sent = await message.answer(text, reply_markup=reply_markup)
-    await state.update_data(current_message_id=sent.message_id)
-    return sent.message_id
 
 # Начало опроса
 @router.message(Command("start"))
@@ -169,10 +230,10 @@ async def cmd_start(message: Message, state: FSMContext):
     
     # Регистрация пользователя
     async with aiosqlite.connect(get_db_path()) as db:
-        # Проверяем реферальный код
-        referral_code = None
+        # Проверяем реферальный параметр (может быть ID или код для обратной совместимости)
+        referral_param = None
         if len(message.text.split()) > 1:
-            referral_code = message.text.split()[1]
+            referral_param = message.text.split()[1]
         
         # Проверяем существование пользователя
         async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -183,12 +244,23 @@ async def cmd_start(message: Message, state: FSMContext):
             ref_code = generate_referral_code(user_id)
             referred_by = None
             
-            if referral_code:
-                # Ищем того, кто пригласил
-                async with db.execute("SELECT user_id FROM users WHERE referral_code = ?", (referral_code,)) as cursor:
-                    referrer = await cursor.fetchone()
-                    if referrer:
-                        referred_by = referrer[0]
+            if referral_param:
+                # Проверяем, является ли параметр числом (ID реферера)
+                try:
+                    referrer_id = int(referral_param)
+                    # Проверяем, существует ли пользователь с таким ID
+                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,)) as cursor:
+                        referrer = await cursor.fetchone()
+                        if referrer:
+                            referred_by = referrer_id
+                            logger.info(f"Найден реферер по ID: {referrer_id}")
+                except ValueError:
+                    # Если не число, пытаемся найти по старому коду (для обратной совместимости)
+                    async with db.execute("SELECT user_id FROM users WHERE referral_code = ?", (referral_param,)) as cursor:
+                        referrer = await cursor.fetchone()
+                        if referrer:
+                            referred_by = referrer[0]
+                            logger.info(f"Найден реферер по старому коду: {referral_param}")
             
             await db.execute(
                 "INSERT INTO users (user_id, username, full_name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)",
@@ -205,15 +277,64 @@ async def cmd_start(message: Message, state: FSMContext):
                 await db.commit()
         else:
             # Обновляем информацию о пользователе (username и full_name могут измениться)
-            await db.execute(
-                "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
-                (username, full_name, user_id)
-            )
-            await db.commit()
+            # Также проверяем, нужно ли обновить referred_by, если пользователь пришел по реферальной ссылке
+            referred_by = None
+            if referral_param:
+                # Проверяем, является ли параметр числом (ID реферера)
+                try:
+                    referrer_id = int(referral_param)
+                    # Проверяем, существует ли пользователь с таким ID
+                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,)) as cursor:
+                        referrer = await cursor.fetchone()
+                        if referrer:
+                            referred_by = referrer_id
+                            logger.info(f"Найден реферер по ID для существующего пользователя: {referrer_id}")
+                except ValueError:
+                    # Если не число, пытаемся найти по старому коду (для обратной совместимости)
+                    async with db.execute("SELECT user_id FROM users WHERE referral_code = ?", (referral_param,)) as cursor:
+                        referrer = await cursor.fetchone()
+                        if referrer:
+                            referred_by = referrer[0]
+                            logger.info(f"Найден реферер по старому коду для существующего пользователя: {referral_param}")
+            
+            # Проверяем, есть ли уже referred_by у пользователя
+            async with db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                existing_referred_by = await cursor.fetchone()
+                existing_referred_by = existing_referred_by[0] if existing_referred_by else None
+            
+            # Обновляем referred_by только если его еще нет, но есть новый реферер
+            if not existing_referred_by and referred_by:
+                await db.execute(
+                    "UPDATE users SET username = ?, full_name = ?, referred_by = ? WHERE user_id = ?",
+                    (username, full_name, referred_by, user_id)
+                )
+                await db.commit()
+                
+                # Создаем запись о реферале, если её еще нет
+                async with db.execute(
+                    "SELECT id FROM referrals WHERE referrer_id = ? AND referred_id = ?",
+                    (referred_by, user_id)
+                ) as cursor:
+                    referral_exists = await cursor.fetchone()
+                
+                if not referral_exists:
+                    await db.execute(
+                        "INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)",
+                        (referred_by, user_id)
+                    )
+                    await db.commit()
+                    logger.info(f"Обновлен referred_by для пользователя {user_id}: {referred_by}")
+            else:
+                # Просто обновляем username и full_name
+                await db.execute(
+                    "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
+                    (username, full_name, user_id)
+                )
+                await db.commit()
     
     welcome_text = """👋 <b>Добро пожаловать!</b>
 
-<b>Бесплатный чек-ап давления и образа жизни за 15 минут</b>
+<b>Бесплатный чек-ап артериального давления</b>
 
 Данный опросник подходит для возрастной категории лиц от 15-45 лет.
 
@@ -237,8 +358,7 @@ async def start_survey(callback: CallbackQuery, state: FSMContext):
 
 Согласны ли Вы на обработку ваших персональных и медицинских данных для целей исследования?"""
     
-    await callback.message.edit_text(consent_text, reply_markup=get_yes_no_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    await callback.message.answer(consent_text, reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_consent)
 
 
@@ -248,17 +368,11 @@ async def invite_friend(callback: CallbackQuery, state: FSMContext):
     
     user_id = callback.from_user.id
     
-    # Получаем реферальный код
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute("SELECT referral_code FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            ref_code = row[0] if row else None
+    # Генерируем реферальную ссылку с ID пользователя
+    bot_username = (await callback.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
     
-    if ref_code:
-        bot_username = (await callback.bot.get_me()).username
-        ref_link = f"https://t.me/{bot_username}?start={ref_code}"
-        
-        invite_text = f"""👥 <b>Пригласите друга!</b>
+    invite_text = f"""👥 <b>Пригласите друга!</b>
 
 🔗 Ваша реферальная ссылка:
 <code>{ref_link}</code>
@@ -274,16 +388,14 @@ async def invite_friend(callback: CallbackQuery, state: FSMContext):
 • 🧘 Стресс
 
 Поделитесь ссылкой и получите подарок!"""
-        
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Поделиться ссылкой", url=f"https://t.me/share/url?url={ref_link}&text=Пройди%20бесплатный%20чек-ап%20давления%20и%20образа%20жизни!")],
-            [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
-        ])
-        
-        await callback.message.edit_text(invite_text, reply_markup=keyboard)
-    else:
-        await callback.message.edit_text("❌ Ошибка: не удалось получить реферальную ссылку. Попробуйте позже.", reply_markup=get_main_menu_keyboard())
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Поделиться ссылкой", url=f"https://t.me/share/url?url={ref_link}&text=Пройди%20бесплатный%20чек-ап%20давления%20и%20образа%20жизни!")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
+    ])
+    
+    await callback.message.edit_text(invite_text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "back_to_menu")
@@ -293,7 +405,7 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     
     welcome_text = """👋 <b>Добро пожаловать!</b>
 
-<b>Бесплатный чек-ап давления и образа жизни за 15 минут</b>
+<b>Бесплатный чек-ап артериального давления</b>
 
 Данный опросник подходит для возрастной категории лиц от 15-45 лет.
 
@@ -303,7 +415,7 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 
 Помогите исследованию и проверьте себя! 👇"""
     
-    await callback.message.edit_text(welcome_text, reply_markup=get_main_menu_keyboard())
+    await callback.message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
     await state.set_state(SurveyStates.main_menu)
 
 
@@ -317,101 +429,55 @@ async def process_consent(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(consent=1)
     
-    instruction_text = """<b>2. Инструкция по измерению АД и пульса</b>
-
-Пожалуйста, измерьте своё артериальное давление и пульс, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
-<b>Первое измерение АД/пульса</b>
-Введите значения АД (верхнее/нижнее) и пульс.
-<b>Пример:</b> 120/80 75
-
-⚠️ <b>Важно:</b> Пульс обязателен!"""
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
     
-    await callback.message.edit_text(instruction_text, reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    instruction_text = """<b>2. Инструкция по измерению АД</b>
+
+Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
+
+<b>Первое измерение АД</b>
+Введите значения АД (верхнее/нижнее).
+<b>Пример:</b> 120/80"""
+    
+    await callback.message.answer(instruction_text)
     await state.set_state(SurveyStates.waiting_bp1_values)
 
 
-# Обработчик отмены опроса
-@router.callback_query(StateFilter("*"), F.data == "cancel_survey")
-async def cancel_survey(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.clear()
-    
-    welcome_text = """👋 <b>Добро пожаловать!</b>
-
-<b>Бесплатный чек-ап давления и образа жизни за 15 минут</b>
-
-Данный опросник подходит для возрастной категории лиц от 15-45 лет.
-
-<b>Знаете ли Вы, что такое предгипертония?</b> Это пограничное состояние, когда давление еще не требует лекарств, но уже сигнализирует: пора менять привычки. И оно есть у 30-40% взрослых людей, многие из которых об этом даже не догадываются.
-
-Это не диагноз, а повод задуматься о своем здоровье и получить удобный цифровой срез.
-
-Помогите исследованию и проверьте себя! 👇"""
-    
-    await callback.message.edit_text(welcome_text, reply_markup=get_main_menu_keyboard())
-    await state.set_state(SurveyStates.main_menu)
 
 
 # Первое измерение АД
 @router.message(StateFilter(SurveyStates.waiting_bp1_values))
 async def process_bp1_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    # Парсим формат: 120/80 75 (пульс обязателен)
-    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
+    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
+    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b>\n\n<b>Важно:</b> Пульс обязателен!")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
-    pulse_str = match.group(3)
-    
-    # Проверяем наличие пульса
-    if not pulse_str:
-        await message.answer("❌ Пульс обязателен! Введите в формате: <b>120/80 75</b>\n\nПример: 120/80 75")
-        return
-    
-    pulse = int(pulse_str)
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
     
-    if not (40 <= pulse <= 200):
-        await message.answer("❌ Проверьте значение пульса. Должно быть 40-200.")
-        return
-    
     await state.update_data(
         bp1_systolic=systolic,
-        bp1_diastolic=diastolic,
-        bp1_pulse=pulse
+        bp1_diastolic=diastolic
     )
     
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    data = await state.get_data()
-    current_message_id = data.get("current_message_id")
-    
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
-    
-    if current_message_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=current_message_id,
-                text=time_text,
-                reply_markup=get_cancel_keyboard()
-            )
-        except:
-            sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-            await state.update_data(current_message_id=sent.message_id)
-    else:
-        sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=sent.message_id)
+    await message.answer(time_text)
     
     await state.set_state(SurveyStates.waiting_bp1_time)
 
@@ -426,10 +492,7 @@ async def process_bp1_time(message: Message, state: FSMContext):
     
     await state.update_data(bp1_time=time_text)
     
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    await update_bot_message(message, state, "<b>3. Демография и антропометрия</b>\n\nСколько вам полных лет? (только цифры)", get_cancel_keyboard())
+    await message.answer("<b>3. Демография и антропометрия</b>\n\nСколько вам полных лет? (только цифры)")
     await state.set_state(SurveyStates.waiting_age)
 
 
@@ -442,11 +505,7 @@ async def process_age(message: Message, state: FSMContext):
             await message.answer("❌ Возраст должен быть от 15 до 45 лет.")
             return
         await state.update_data(age=age)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
-        await update_bot_message(message, state, "Ваш пол?", get_gender_keyboard())
+        await message.answer("Ваш пол?", reply_markup=get_gender_keyboard())
         await state.set_state(SurveyStates.waiting_gender)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -455,10 +514,20 @@ async def process_age(message: Message, state: FSMContext):
 @router.callback_query(StateFilter(SurveyStates.waiting_gender), F.data.startswith("gender_"))
 async def process_gender(callback: CallbackQuery, state: FSMContext):
     gender = "мужской" if callback.data == "gender_male" else "женский"
+    gender_text = "👨 Мужской" if callback.data == "gender_male" else "👩 Женский"
     await state.update_data(gender=gender)
     await callback.answer()
-    await callback.message.edit_text("Ваш рост в сантиметрах? (только цифры)", reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {gender_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("Ваш рост в сантиметрах? (только цифры)")
     await state.set_state(SurveyStates.waiting_height)
 
 
@@ -470,11 +539,7 @@ async def process_height(message: Message, state: FSMContext):
             await message.answer("❌ Рост должен быть от 100 до 250 см.")
             return
         await state.update_data(height=height)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
-        await update_bot_message(message, state, "Ваш вес в килограммах? (только цифры)", get_cancel_keyboard())
+        await message.answer("Ваш вес в килограммах? (только цифры)")
         await state.set_state(SurveyStates.waiting_weight)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -494,10 +559,11 @@ async def process_weight(message: Message, state: FSMContext):
         
         await state.update_data(weight=weight, bmi=bmi)
         
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
+        # Отправляем ИМТ отдельно
+        await message.answer(f"Ваш ИМТ: <b>{bmi}</b>")
         
-        await update_bot_message(message, state, f"Ваш ИМТ: <b>{bmi}</b>\n\nКакой у Вас уровень образования?", get_education_keyboard())
+        # Затем отправляем вопрос об образовании
+        await message.answer("Какой у Вас уровень образования?", reply_markup=get_education_keyboard())
         await state.set_state(SurveyStates.waiting_education)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -514,8 +580,17 @@ async def process_education(callback: CallbackQuery, state: FSMContext):
     education = education_map[callback.data]
     await state.update_data(education=education)
     await callback.answer()
-    await callback.message.edit_text("Как Вы оцениваете свою финансовую стабильность?", reply_markup=get_financial_stability_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {education}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("Как Вы оцениваете свою финансовую стабильность?", reply_markup=get_financial_stability_keyboard())
     await state.set_state(SurveyStates.waiting_financial_stability)
 
 
@@ -530,8 +605,16 @@ async def process_financial_stability(callback: CallbackQuery, state: FSMContext
     await state.update_data(financial_stability=finance)
     await callback.answer()
     
-    await callback.message.edit_text("<b>4. Образ жизни и привычки</b>\n\nКурите ли Вы сейчас или курили в последние 12 месяцев?", reply_markup=get_yes_no_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {finance}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("<b>4. Образ жизни и привычки</b>\n\n<b>Курение</b>\n\nКурите ли Вы сейчас или курили в последние 12 месяцев?", reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_smoking)
 
 
@@ -539,10 +622,20 @@ async def process_financial_stability(callback: CallbackQuery, state: FSMContext
 @router.callback_query(StateFilter(SurveyStates.waiting_smoking), F.data.in_(["yes", "no"]))
 async def process_smoking(callback: CallbackQuery, state: FSMContext):
     smoking = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(smoking=smoking)
     await callback.answer()
-    await callback.message.edit_text("Сколько раз в неделю Вы употребляете алкоголь? (только цифры)", reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("<b>Алкоголь</b>\n\nСколько раз в неделю Вы употребляете алкоголь? (только цифры)")
     await state.set_state(SurveyStates.waiting_alcohol)
 
 
@@ -554,11 +647,7 @@ async def process_alcohol(message: Message, state: FSMContext):
             await message.answer("❌ Количество должно быть от 0 до 7 раз в неделю.")
             return
         await state.update_data(alcohol_per_week=alcohol)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
-        await update_bot_message(message, state, "Сколько грамм соли в день, по Вашему мнению, Вы потребляете?\n(помните, что в чайной ложке без горки содержится примерно 7 г соли!) (только цифры)", get_cancel_keyboard())
+        await message.answer("Сколько грамм соли в день, по Вашему мнению, Вы потребляете?\n(помните, что в чайной ложке без горки содержится примерно 7 г соли!) (только цифры)")
         await state.set_state(SurveyStates.waiting_salt)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -572,11 +661,7 @@ async def process_salt(message: Message, state: FSMContext):
             await message.answer("❌ Количество соли должно быть от 0 до 50 г.")
             return
         await state.update_data(salt_per_day=salt)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
-        await update_bot_message(message, state, "Есть ли у Вас другие вредные привычки (энергетики, наркотики)?", get_yes_no_keyboard())
+        await message.answer("<b>Другие вредные привычки</b>\n\nЕсть ли у Вас другие вредные привычки?\n\nНапример:\n• Энергетики\n• Более 3 чашек кофе в день\n• Другие стимуляторы", reply_markup=get_yes_no_keyboard())
         await state.set_state(SurveyStates.waiting_other_habits)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -585,10 +670,20 @@ async def process_salt(message: Message, state: FSMContext):
 @router.callback_query(StateFilter(SurveyStates.waiting_other_habits), F.data.in_(["yes", "no"]))
 async def process_other_habits(callback: CallbackQuery, state: FSMContext):
     other_habits = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(other_habits=other_habits)
     await callback.answer()
-    await callback.message.edit_text("Сколько часов в день Вы проводите за экраном? (только цифры)", reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("Сколько часов в день Вы проводите за экраном? (только цифры)")
     await state.set_state(SurveyStates.waiting_screen_time)
 
 
@@ -601,13 +696,10 @@ async def process_screen_time(message: Message, state: FSMContext):
             return
         await state.update_data(screen_time=screen_time)
         
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
         activity_text = """Занимаетесь ли Вы физической активностью? 
 
 По определению ВОЗ, физическая активность — это какое-либо движение тела, производимое скелетными мышцами, которое требует расхода энергии. Термин «физическая активность» относится к любым видам движений, в том числе ходьба 30 минут 5 раз в неделю, бег, танцы, плавание, садоводство, домашние дела, работа?"""
-        await update_bot_message(message, state, activity_text, get_yes_no_keyboard())
+        await message.answer(activity_text, reply_markup=get_yes_no_keyboard())
         await state.set_state(SurveyStates.waiting_physical_activity)
     except ValueError:
         await message.answer("❌ Введите только цифры.")
@@ -616,57 +708,84 @@ async def process_screen_time(message: Message, state: FSMContext):
 @router.callback_query(StateFilter(SurveyStates.waiting_physical_activity), F.data.in_(["yes", "no"]))
 async def process_physical_activity(callback: CallbackQuery, state: FSMContext):
     physical_activity = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(physical_activity=physical_activity)
     await callback.answer()
-    await callback.message.edit_text("Предполагает ли Ваша работа ночные дежурства?", reply_markup=get_yes_no_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("Предполагает ли Ваша работа ночные дежурства?", reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_night_shifts)
 
 
 @router.callback_query(StateFilter(SurveyStates.waiting_night_shifts), F.data.in_(["yes", "no"]))
 async def process_night_shifts(callback: CallbackQuery, state: FSMContext):
     night_shifts = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(night_shifts=night_shifts)
     await callback.answer()
     
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
     if night_shifts:
-        await callback.message.edit_text("На какую ставку Вы работаете?", reply_markup=get_night_shifts_rate_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+        await callback.message.answer("На какую ставку Вы работаете?", reply_markup=get_night_shifts_rate_keyboard())
         await state.set_state(SurveyStates.waiting_night_shifts_rate)
     else:
         await state.update_data(night_shifts_rate="")
         # Переходим ко второму измерению АД
-        instruction_text = """<b>5. Инструкция по измерению АД и пульса</b>
+        instruction_text = """<b>5. Инструкция по измерению АД</b>
 
-Пожалуйста, измерьте своё артериальное давление и пульс, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
+Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
 
-<b>Второе измерение АД/пульса</b>
-Введите значения АД (верхнее/нижнее) и пульс.
-<b>Пример:</b> 120/80 75
-
-⚠️ <b>Важно:</b> Пульс обязателен!"""
-        await callback.message.edit_text(instruction_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+<b>Второе измерение АД</b>
+Введите значения АД (верхнее/нижнее).
+<b>Пример:</b> 120/80"""
+        await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp2_values)
 
 
 @router.callback_query(StateFilter(SurveyStates.waiting_night_shifts_rate), F.data.startswith("shift_"))
 async def process_night_shifts_rate(callback: CallbackQuery, state: FSMContext):
-    rate = "> 1 ставки" if callback.data == "shift_more" else "< 1 ставки"
+    if callback.data == "shift_more":
+        rate = "> 1 ставки"
+    elif callback.data == "shift_equal":
+        rate = "= 1 ставки"
+    else:
+        rate = "< 1 ставки"
     await state.update_data(night_shifts_rate=rate)
     await callback.answer()
     
-    instruction_text = """<b>5. Инструкция по измерению АД и пульса</b>
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {rate}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    instruction_text = """<b>5. Инструкция по измерению АД</b>
 
-Пожалуйста, измерьте своё артериальное давление и пульс, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
+Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
 
-<b>Второе измерение АД/пульса</b>
-Введите значения АД (верхнее/нижнее) и пульс.
-<b>Пример:</b> 120/80 75
-
-⚠️ <b>Важно:</b> Пульс обязателен!"""
-    await callback.message.edit_text(instruction_text, reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+<b>Второе измерение АД</b>
+Введите значения АД (верхнее/нижнее).
+<b>Пример:</b> 120/80"""
+    await callback.message.answer(instruction_text)
     await state.set_state(SurveyStates.waiting_bp2_values)
 
 
@@ -674,59 +793,27 @@ async def process_night_shifts_rate(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(SurveyStates.waiting_bp2_values))
 async def process_bp2_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
+    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
+    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b>\n\n<b>Важно:</b> Пульс обязателен!")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
-    pulse_str = match.group(3)
-    
-    # Проверяем наличие пульса
-    if not pulse_str:
-        await message.answer("❌ Пульс обязателен! Введите в формате: <b>120/80 75</b>\n\nПример: 120/80 75")
-        return
-    
-    pulse = int(pulse_str)
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
     
-    if not (40 <= pulse <= 200):
-        await message.answer("❌ Проверьте значение пульса. Должно быть 40-200.")
-        return
-    
     await state.update_data(
         bp2_systolic=systolic,
-        bp2_diastolic=diastolic,
-        bp2_pulse=pulse
+        bp2_diastolic=diastolic
     )
     
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    data = await state.get_data()
-    current_message_id = data.get("current_message_id")
-    
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
-    
-    if current_message_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=current_message_id,
-                text=time_text,
-                reply_markup=get_cancel_keyboard()
-            )
-        except:
-            sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-            await state.update_data(current_message_id=sent.message_id)
-    else:
-        sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=sent.message_id)
+    await message.answer(time_text)
     
     await state.set_state(SurveyStates.waiting_bp2_time)
 
@@ -739,11 +826,7 @@ async def process_bp2_time(message: Message, state: FSMContext):
         return
     
     await state.update_data(bp2_time=time_text)
-    
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    await update_bot_message(message, state, "<b>6. Медицинская история</b>\n\nЕсть ли у Вас какие-то хронические заболевания?", get_chronic_diseases_keyboard())
+    await message.answer("<b>6. Медицинская история</b>\n\nЕсть ли у Вас какие-то хронические заболевания?", reply_markup=get_chronic_diseases_keyboard())
     await state.set_state(SurveyStates.waiting_chronic_diseases)
 
 
@@ -761,18 +844,37 @@ async def process_chronic_diseases(callback: CallbackQuery, state: FSMContext):
     disease = disease_map[callback.data]
     await state.update_data(chronic_diseases=disease)
     await callback.answer()
-    await callback.message.edit_text("Принимаете ли Вы какие-либо лекарственные средства на постоянной основе?", reply_markup=get_yes_no_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {disease}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("Принимаете ли Вы какие-либо лекарственные средства на постоянной основе?", reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_medications)
 
 
 @router.callback_query(StateFilter(SurveyStates.waiting_medications), F.data.in_(["yes", "no"]))
 async def process_medications(callback: CallbackQuery, state: FSMContext):
     medications = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(medications=medications)
     await callback.answer()
-    await callback.message.edit_text("<b>7. Семейный анамнез</b>\n\nЕсть ли у ваших близких родственников (родители, братья/сестры/бабушки/дедушки) гипертония/инфаркт/инсульт?", reply_markup=get_yes_no_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("<b>7. Семейный анамнез</b>\n\nЕсть ли у ваших близких родственников (родители, братья/сестры/бабушки/дедушки) гипертония/инфаркт/инсульт?", reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_family_history)
 
 
@@ -780,10 +882,20 @@ async def process_medications(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(StateFilter(SurveyStates.waiting_family_history), F.data.in_(["yes", "no"]))
 async def process_family_history(callback: CallbackQuery, state: FSMContext):
     family_history = 1 if callback.data == "yes" else 0
+    answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(family_history=family_history)
     await callback.answer()
-    await callback.message.edit_text("<b>8. Психическое здоровье и стресс</b>\n\nОцените уровень стресса в Вашей жизни за последний месяц по шкале от 1 до 10\n(1 — совсем нет, 10 — очень сильный).", reply_markup=get_cancel_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("<b>8. Психическое здоровье и стресс</b>\n\nОцените уровень стресса в Вашей жизни за последний месяц по шкале от 1 до 10\n(1 — совсем нет, 10 — очень сильный).")
     await state.set_state(SurveyStates.waiting_stress_level)
 
 
@@ -796,11 +908,7 @@ async def process_stress_level(message: Message, state: FSMContext):
             await message.answer("❌ Оценка должна быть от 1 до 10.")
             return
         await state.update_data(stress_level=stress)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
-        await update_bot_message(message, state, "Оцените качество вашего сна за последний месяц по шкале от 1 до 10\n(1 — очень плохое, 10 — отличное).", get_cancel_keyboard())
+        await message.answer("Оцените качество вашего сна за последний месяц по шкале от 1 до 10\n(1 — очень плохое, 10 — отличное).")
         await state.set_state(SurveyStates.waiting_sleep_quality)
     except ValueError:
         await message.answer("❌ Введите только цифры от 1 до 10.")
@@ -815,15 +923,12 @@ async def process_sleep_quality(message: Message, state: FSMContext):
             return
         await state.update_data(sleep_quality=sleep)
         
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
         phq_text = """<b>PHQ-2</b>
 
 Как часто Вас беспокоили следующие проблемы за последние 2 недели?
 
 <b>1. У Вас был снижен интерес или удовольствие от выполнения ежедневных дел</b>"""
-        await update_bot_message(message, state, phq_text, get_phq_keyboard())
+        await message.answer(phq_text, reply_markup=get_phq_keyboard())
         await state.set_state(SurveyStates.waiting_phq2_q1)
     except ValueError:
         await message.answer("❌ Введите только цифры от 1 до 10.")
@@ -832,21 +937,43 @@ async def process_sleep_quality(message: Message, state: FSMContext):
 @router.callback_query(StateFilter(SurveyStates.waiting_phq2_q1), F.data.startswith("phq_"))
 async def process_phq2_q1(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[1])
+    phq_text_map = {0: "Ни разу", 1: "Несколько дней", 2: "Более половины времени", 3: "Почти каждый день"}
+    answer_text = phq_text_map.get(score, "")
     await state.update_data(phq2_q1=score)
     await callback.answer()
-    await callback.message.edit_text("<b>2. У Вас было плохое настроение, Вы были подавлены или испытывали чувство безысходности</b>", reply_markup=get_phq_keyboard())
-    await state.update_data(current_message_id=callback.message.message_id)
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
+    await callback.message.answer("<b>2. У Вас было плохое настроение, Вы были подавлены или испытывали чувство безысходности</b>", reply_markup=get_phq_keyboard())
     await state.set_state(SurveyStates.waiting_phq2_q2)
 
 
 @router.callback_query(StateFilter(SurveyStates.waiting_phq2_q2), F.data.startswith("phq_"))
 async def process_phq2_q2(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[1])
+    phq_text_map = {0: "Ни разу", 1: "Несколько дней", 2: "Более половины времени", 3: "Почти каждый день"}
+    answer_text = phq_text_map.get(score, "")
     data = await state.get_data()
     phq2_q1 = data.get("phq2_q1", 0)
     phq2_score = phq2_q1 + score
     await state.update_data(phq2_q2=score, phq2_score=phq2_score)
     await callback.answer()
+    
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
     
     if phq2_score > 2:
         # Переходим к PHQ-9
@@ -855,24 +982,20 @@ async def process_phq2_q2(callback: CallbackQuery, state: FSMContext):
 Как часто Вас беспокоили следующие проблемы за последние 2 недели?
 
 <b>3. Вам было трудно заснуть или у Вас прерывистый сон, или Вы слишком много спали</b>"""
-        await callback.message.edit_text(phq9_text, reply_markup=get_phq_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+        await callback.message.answer(phq9_text, reply_markup=get_phq_keyboard())
         await state.set_state(SurveyStates.waiting_phq9)
         await state.update_data(phq9_answered=0, phq9_scores=[])  # Инициализируем счетчики
     else:
         await state.update_data(phq9_score=0)
         # Переходим к третьему измерению АД
-        instruction_text = """<b>9. Инструкция по измерению АД и пульса</b>
+        instruction_text = """<b>9. Инструкция по измерению АД</b>
 
-Пожалуйста, измерьте своё артериальное давление и пульс, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
+Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
 
-<b>Третье измерение АД/пульса</b>
-Введите значения АД (верхнее/нижнее) и пульс.
-<b>Пример:</b> 120/80 75
-
-⚠️ <b>Важно:</b> Пульс обязателен!"""
-        await callback.message.edit_text(instruction_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+<b>Третье измерение АД</b>
+Введите значения АД (верхнее/нижнее).
+<b>Пример:</b> 120/80"""
+        await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp3_values)
 
 
@@ -891,6 +1014,8 @@ phq9_questions = [
 @router.callback_query(StateFilter(SurveyStates.waiting_phq9), F.data.startswith("phq_"))
 async def process_phq9(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[1])
+    phq_text_map = {0: "Ни разу", 1: "Несколько дней", 2: "Более половины времени", 3: "Почти каждый день"}
+    answer_text = phq_text_map.get(score, "")
     data = await state.get_data()
     phq9_answered = data.get("phq9_answered", 0)  # Количество отвеченных вопросов PHQ-9
     phq9_scores = data.get("phq9_scores", [])
@@ -902,11 +1027,19 @@ async def process_phq9(callback: CallbackQuery, state: FSMContext):
     await state.update_data(phq9_answered=phq9_answered, phq9_scores=phq9_scores)
     await callback.answer()
     
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
     if phq9_answered < len(phq9_questions):
         # Следующий вопрос
         next_q = phq9_questions[phq9_answered]
-        await callback.message.edit_text(f"<b>{next_q[0]}. {next_q[1]}</b>", reply_markup=get_phq_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+        await callback.message.answer(f"<b>{next_q[0]}. {next_q[1]}</b>", reply_markup=get_phq_keyboard())
     else:
         # Все вопросы PHQ-9 отвечены
         phq2_score = data.get("phq2_score", 0)
@@ -914,17 +1047,14 @@ async def process_phq9(callback: CallbackQuery, state: FSMContext):
         total_phq9 = phq2_score + sum(phq9_scores)
         await state.update_data(phq9_score=total_phq9)
         
-        instruction_text = """<b>9. Инструкция по измерению АД и пульса</b>
+        instruction_text = """<b>9. Инструкция по измерению АД</b>
 
-Пожалуйста, измерьте своё артериальное давление и пульс, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
+Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
 
-<b>Третье измерение АД/пульса</b>
-Введите значения АД (верхнее/нижнее) и пульс.
-<b>Пример:</b> 120/80 75
-
-⚠️ <b>Важно:</b> Пульс обязателен!"""
-        await callback.message.edit_text(instruction_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id)
+<b>Третье измерение АД</b>
+Введите значения АД (верхнее/нижнее).
+<b>Пример:</b> 120/80"""
+        await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp3_values)
 
 
@@ -932,59 +1062,27 @@ async def process_phq9(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(SurveyStates.waiting_bp3_values))
 async def process_bp3_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
+    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
+    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b>\n\n<b>Важно:</b> Пульс обязателен!")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
-    pulse_str = match.group(3)
-    
-    # Проверяем наличие пульса
-    if not pulse_str:
-        await message.answer("❌ Пульс обязателен! Введите в формате: <b>120/80 75</b>\n\nПример: 120/80 75")
-        return
-    
-    pulse = int(pulse_str)
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
     
-    if not (40 <= pulse <= 200):
-        await message.answer("❌ Проверьте значение пульса. Должно быть 40-200.")
-        return
-    
     await state.update_data(
         bp3_systolic=systolic,
-        bp3_diastolic=diastolic,
-        bp3_pulse=pulse
+        bp3_diastolic=diastolic
     )
     
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    data = await state.get_data()
-    current_message_id = data.get("current_message_id")
-    
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
-    
-    if current_message_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=current_message_id,
-                text=time_text,
-                reply_markup=get_cancel_keyboard()
-            )
-        except:
-            sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-            await state.update_data(current_message_id=sent.message_id)
-    else:
-        sent = await message.answer(time_text, reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=sent.message_id)
+    await message.answer(time_text)
     
     await state.set_state(SurveyStates.waiting_bp3_time)
 
@@ -997,11 +1095,7 @@ async def process_bp3_time(message: Message, state: FSMContext):
         return
     
     await state.update_data(bp3_time=time_text)
-    
-    # Удаляем сообщение пользователя
-    await delete_user_message(message)
-    
-    await update_bot_message(message, state, "<b>10. Как Вы узнали об этом чат-боте?</b>", get_referral_source_keyboard())
+    await message.answer("<b>10. Как Вы узнали об этом чат-боте?</b>", reply_markup=get_referral_source_keyboard())
     await state.set_state(SurveyStates.waiting_referral_source)
 
 
@@ -1017,8 +1111,8 @@ async def process_referral_source(callback: CallbackQuery, state: FSMContext):
     
     if callback.data == "source_other":
         await callback.answer()
-        await callback.message.edit_text("Введите свой вариант:", reply_markup=get_cancel_keyboard())
-        await state.update_data(current_message_id=callback.message.message_id, referral_source_custom=True)
+        await callback.message.answer("Введите свой вариант:")
+        await state.update_data(referral_source_custom=True)
         await state.set_state(SurveyStates.waiting_referral_source)
         return
     
@@ -1026,8 +1120,19 @@ async def process_referral_source(callback: CallbackQuery, state: FSMContext):
     await state.update_data(referral_source=referral_source, referral_source_custom=False)
     await callback.answer()
     
+    # Обновляем сообщение, добавляя выбранный ответ
+    original_text = callback.message.text or ""
+    updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {referral_source}"
+    
+    try:
+        await callback.message.edit_text(updated_text, reply_markup=None)
+    except:
+        pass
+    
     # Завершаем опрос и сохраняем данные
-    await finish_survey(callback.message, state)
+    # Используем callback.from_user.id напрямую, чтобы гарантировать правильный ID
+    # Передаем правильный user_id в finish_survey
+    await finish_survey(callback.message, state, user_id_override=callback.from_user.id)
 
 
 @router.message(StateFilter(SurveyStates.waiting_referral_source))
@@ -1035,19 +1140,57 @@ async def process_referral_source_text(message: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("referral_source_custom"):
         await state.update_data(referral_source=message.text.strip(), referral_source_custom=False)
-        
-        # Удаляем сообщение пользователя
-        await delete_user_message(message)
-        
         await finish_survey(message, state)
     else:
         await message.answer("Пожалуйста, выберите вариант из меню.")
 
 
-async def finish_survey(message: Message, state: FSMContext):
+async def finish_survey(message: Message, state: FSMContext, user_id_override: int = None):
     """Завершение опроса, расчет результатов и сохранение в БД"""
     data = await state.get_data()
-    user_id = message.from_user.id
+    # Используем переданный user_id, если он указан, иначе берем из message
+    user_id = user_id_override if user_id_override is not None else message.from_user.id
+    
+    # Логируем информацию о пользователе для отладки
+    logger.info(f"🔍 finish_survey: user_id = {user_id}, from_user.id = {message.from_user.id}, from_user.username = {message.from_user.username}")
+    logger.info(f"🔍 message.chat.id = {message.chat.id}, message.from_user.full_name = {message.from_user.full_name}")
+    
+    # Убеждаемся, что пользователь существует в БД
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user_exists = await cursor.fetchone()
+        
+        if not user_exists:
+            # Создаем пользователя, если его нет
+            from app.utils.referral import generate_referral_code
+            ref_code = generate_referral_code(user_id)
+            username = message.from_user.username or "Не указано"
+            full_name = message.from_user.full_name or "Не указано"
+            
+            # Проверяем, был ли пользователь приглашен (проверяем таблицу referrals)
+            referred_by = None
+            async with db.execute(
+                "SELECT referrer_id FROM referrals WHERE referred_id = ?",
+                (user_id,)
+            ) as cursor:
+                referral_row = await cursor.fetchone()
+                if referral_row and referral_row[0]:
+                    referred_by = referral_row[0]
+                    logger.info(f"Найден реферер для пользователя {user_id}: {referred_by}")
+            
+            logger.info(f"📝 Создание пользователя: user_id={user_id}, username={username}, full_name={full_name}, referred_by={referred_by}")
+            await db.execute(
+                "INSERT INTO users (user_id, username, full_name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, full_name, ref_code, referred_by)
+            )
+            await db.commit()
+            
+            # Проверяем, что пользователь действительно создан
+            async with db.execute("SELECT user_id, username, referred_by FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                created_user = await cursor.fetchone()
+                logger.info(f"✅ Проверка созданного пользователя: {created_user}")
+            
+            logger.info(f"Создан пользователь {user_id} при завершении опроса, referred_by = {referred_by}")
     
     # Вычисляем среднее АД из трех измерений
     bp1_sys = data.get("bp1_systolic", 0)
@@ -1075,6 +1218,7 @@ async def finish_survey(message: Message, state: FSMContext):
     recommendations = get_recommendations(bp_category, risk_level, data)
     
     # Сохраняем в БД
+    logger.info(f"📝 Сохранение опроса: user_id={user_id}")
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("""
             INSERT INTO surveys (
@@ -1082,11 +1226,11 @@ async def finish_survey(message: Message, state: FSMContext):
                 smoking, alcohol_per_week, salt_per_day, other_habits, screen_time, physical_activity,
                 night_shifts, night_shifts_rate, chronic_diseases, medications, family_history,
                 stress_level, sleep_quality, phq2_score, phq9_score,
-                bp1_systolic, bp1_diastolic, bp1_pulse, bp1_time,
-                bp2_systolic, bp2_diastolic, bp2_pulse, bp2_time,
-                bp3_systolic, bp3_diastolic, bp3_pulse, bp3_time,
+                bp1_systolic, bp1_diastolic, bp1_time,
+                bp2_systolic, bp2_diastolic, bp2_time,
+                bp3_systolic, bp3_diastolic, bp3_time,
                 referral_source, risk_level, risk_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id, data.get("consent"), data.get("age"), data.get("gender"),
             data.get("height"), data.get("weight"), data.get("bmi"),
@@ -1097,9 +1241,9 @@ async def finish_survey(message: Message, state: FSMContext):
             data.get("chronic_diseases"), data.get("medications"), data.get("family_history"),
             data.get("stress_level"), data.get("sleep_quality"),
             data.get("phq2_score", 0), data.get("phq9_score", 0),
-            data.get("bp1_systolic"), data.get("bp1_diastolic"), data.get("bp1_pulse", 0), data.get("bp1_time"),
-            data.get("bp2_systolic"), data.get("bp2_diastolic"), data.get("bp2_pulse", 0), data.get("bp2_time"),
-            data.get("bp3_systolic"), data.get("bp3_diastolic"), data.get("bp3_pulse", 0), data.get("bp3_time"),
+            data.get("bp1_systolic"), data.get("bp1_diastolic"), data.get("bp1_time"),
+            data.get("bp2_systolic"), data.get("bp2_diastolic"), data.get("bp2_time"),
+            data.get("bp3_systolic"), data.get("bp3_diastolic"), data.get("bp3_time"),
             data.get("referral_source"), risk_level, risk_score
         ))
         await db.commit()
@@ -1114,7 +1258,7 @@ async def finish_survey(message: Message, state: FSMContext):
 
 {recommendations}
 
-<b>Ваши данные очень помогли нашему исследованию.</b>
+<b>Ваши данные очень помогли нашему исследованию. Спасибо!</b>
 
 Небольшая просьба: если у вас есть друг или родственник, который тоже заботится о здоровье (или наоборот, вечно откладывает поход к врачу) — скиньте ему ссылку на прохождение чат-бота.
 
@@ -1129,42 +1273,28 @@ async def finish_survey(message: Message, state: FSMContext):
         diary_text = "\n\n📝 <b>Дневник давления</b>\nРекомендуем измерять давление каждые 4 часа и записывать результаты."
         result_text = result_text.replace(recommendations, recommendations + diary_text)
     
-    # Проверяем, есть ли у пользователя рефералы (приглашенные друзья)
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND gift_claimed = 0",
-            (user_id,)
-        ) as cursor:
-            has_referrals = (await cursor.fetchone())[0] > 0
-        
-        # Получаем реферальный код пользователя
-        async with db.execute("SELECT referral_code FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            ref_code = row[0] if row else None
-    
-    # Обновляем последнее сообщение бота с результатами
-    data = await state.get_data()
-    current_message_id = data.get("current_message_id")
-    
     # Всегда показываем выбор подарка после завершения опроса
-    if current_message_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=current_message_id,
-                text=result_text,
-                reply_markup=get_gift_keyboard()
-            )
-        except:
-            sent = await message.answer(result_text, reply_markup=get_gift_keyboard())
-            await state.update_data(current_message_id=sent.message_id)
-    else:
-        sent = await message.answer(result_text, reply_markup=get_gift_keyboard())
-        await state.update_data(current_message_id=sent.message_id)
+    # Используем bot.send_message для гарантии правильной работы
+    await message.bot.send_message(chat_id=message.chat.id, text=result_text, reply_markup=get_gift_keyboard())
     await state.set_state(SurveyStates.waiting_gift_choice)
     
-    # Отправляем уведомление админам о прохождении опроса
-    await notify_admins_about_survey(message.bot, user_id)
+    # Отправляем дневник давления пользователям с умеренным или высоким уровнем риска
+    if risk_level in ["умеренный", "высокий"]:
+        diary_file_path = os.path.join("file", "Дневник давления.pdf")
+        if os.path.exists(diary_file_path):
+            try:
+                diary_file = FSInputFile(diary_file_path, filename="Дневник давления.pdf")
+                diary_text = "Распечатайте и ведите дневник давления! Это самый простой и наглядный способ отслеживать динамику и заботиться о себе."
+                await message.bot.send_document(
+                    chat_id=message.chat.id,
+                    document=diary_file,
+                    caption=diary_text
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при отправке дневника давления: {e}", exc_info=True)
+    
+    # Отправляем подарок рефереру, если пользователь был приглашен
+    await send_gift_to_referrer(message.bot, user_id)
 
 
 # Выбор подарка
@@ -1189,99 +1319,51 @@ async def process_gift_choice(callback: CallbackQuery, state: FSMContext):
         
         await callback.answer(f"✅ Вы выбрали подарок: {gift_type}")
         
-        # Получаем информацию о последнем опросе пользователя
-        async with db.execute(
-            """SELECT risk_level, risk_score, 
-               (bp1_systolic + bp2_systolic + bp3_systolic) / 3 as avg_sys,
-               (bp1_diastolic + bp2_diastolic + bp3_diastolic) / 3 as avg_dia
-               FROM surveys WHERE user_id = ? ORDER BY completed_at DESC LIMIT 1""",
-            (user_id,)
-        ) as cursor:
-            survey_row = await cursor.fetchone()
-            if survey_row:
-                risk_level = survey_row[0] or "не определен"
-                risk_score = survey_row[1] or 0
-                avg_systolic = int(survey_row[2] or 0)
-                avg_diastolic = int(survey_row[3] or 0)
-                
-                # Определяем категорию АД
-                bp_category = categorize_bp(avg_systolic, avg_diastolic)
-                
-                # Получаем рекомендации (упрощенная версия)
-                recommendations = "Рекомендации сохранены в вашем профиле."
-            else:
-                risk_level = "не определен"
-                risk_score = 0
-                avg_systolic = 0
-                avg_diastolic = 0
-                bp_category = "не определено"
-                recommendations = ""
+        # Генерируем реферальную ссылку с ID пользователя
+        bot_username = (await callback.message.bot.get_me()).username
+        ref_link = f"https://t.me/{bot_username}?start={user_id}"
         
-        # Получаем реферальную ссылку
-        async with db.execute("SELECT referral_code FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            ref_code = row[0] if row else None
-        
-        # После выбора подарка сразу показываем ссылку для приглашения
-        result_text = f"""<b>📊 Результаты</b>
-
-<b>Категория АД:</b> {bp_category}
-<b>Среднее АД:</b> {avg_systolic}/{avg_diastolic} мм рт.ст.
-<b>Балл риска:</b> {risk_score}
-<b>Уровень риска:</b> <b>{risk_level.upper()}</b>
-
-{recommendations}
-
-<b>Ваши данные очень помогли нашему исследованию.</b>
-
-Небольшая просьба: если у вас есть друг или родственник, который тоже заботится о здоровье (или наоборот, вечно откладывает поход к врачу) — скиньте ему ссылку на прохождение чат-бота.
-
-Для него это — быстрая самопроверка, для нас — важные данные. Будем очень благодарны!
-
-<b>«За каждого друга, который пройдет опрос по Вашей рекомендации, мы вышлем Вам приятный и полезный подарок»</b>
+        # Формируем новое сообщение
+        gift_message = f"""✅ <b>Подарок выбран!</b>
 
 Вы выбрали подарок: <b>{gift_type}</b>
-Мы свяжемся с Вами для отправки подарка."""
+
+🔗 <b>Ваша реферальная ссылка:</b>
+{ref_link}
+
+📋 <b>Инструкция:</b>
+1. Скопируйте ссылку
+2. Отправьте её другу
+3. После того, как друг пройдет тест, вы получите подарок!"""
         
-        if ref_code:
-            bot_username = (await callback.message.bot.get_me()).username
-            ref_link = f"https://t.me/{bot_username}?start={ref_code}"
-            result_text += f"\n\n🔗 <b>Ваша реферальная ссылка:</b>\n{ref_link}\n\nПоделитесь ею с друзьями и получите подарок!"
-        
-        # Создаем клавиатуру с кнопками "Пригласить друга" и "Пройти тестирование ещё раз"
-        final_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Пригласить друга", callback_data="invite_friend_after_survey")],
-            [InlineKeyboardButton(text="🔄 Пройти тестирование ещё раз", callback_data="start_survey")]
+        # Создаем клавиатуру с кнопкой "Пройти тест еще раз", которая отправляет команду /start
+        restart_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Пройти тест еще раз", callback_data="restart_survey")]
         ])
         
-        await callback.message.edit_text(result_text, reply_markup=final_keyboard)
+        # Отправляем новое сообщение
+        await callback.message.answer(gift_message, reply_markup=restart_keyboard)
     
     await state.clear()
 
 
+# Обработчик кнопки "Пройти тест еще раз"
+@router.callback_query(F.data == "restart_survey")
+async def restart_survey_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Пройти тест еще раз' - отправляет команду /start"""
+    await state.clear()
+    await callback.answer()
+    
+    # Создаем правильный объект Message для вызова cmd_start
+    # Используем model_copy для создания копии с измененными полями
+    fake_message = callback.message.model_copy(update={
+        "text": "/start",
+        "from_user": callback.from_user,
+        "message_id": callback.message.message_id + 1000
+    })
+    
+    # Вызываем обработчик команды /start
+    await cmd_start(fake_message, state)
+
+
 # Обработчик кнопки "Пригласить друга" после выбора подарка
-@router.callback_query(F.data == "invite_friend_after_survey")
-async def invite_friend_after_survey(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    
-    async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute("SELECT referral_code FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            ref_code = row[0] if row else None
-    
-    if ref_code:
-        bot_username = (await callback.message.bot.get_me()).username
-        ref_link = f"https://t.me/{bot_username}?start={ref_code}"
-        # Создаем клавиатуру с кнопкой "Пройти тестирование ещё раз"
-        restart_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Пройти тестирование ещё раз", callback_data="start_survey")]
-        ])
-        
-        await callback.message.edit_text(
-            f"👥 <b>Пригласите друга!</b>\n\n"
-            f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
-            f"Поделитесь ею с друзьями и получите подарок за каждого, кто пройдет опрос!",
-            reply_markup=restart_keyboard
-        )
-    else:
-        await callback.answer("❌ Ошибка получения реферальной ссылки", show_alert=True)
