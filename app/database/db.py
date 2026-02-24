@@ -67,6 +67,11 @@ async def init_db():
                 bp3_systolic INTEGER,
                 bp3_diastolic INTEGER,
                 bp3_time TEXT,
+                bp1_pulse INTEGER,
+                bp2_pulse INTEGER,
+                bp3_pulse INTEGER,
+                tonometer_model TEXT,
+                medications_text TEXT,
                 referral_source TEXT,
                 risk_level TEXT,
                 risk_score INTEGER,
@@ -96,6 +101,14 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_referral_code ON users(referral_code)
         """)
         
+        # Миграция: добавляем новые колонки, если их нет
+        for col in ["bp1_pulse", "bp2_pulse", "bp3_pulse", "tonometer_model", "medications_text"]:
+            try:
+                await db.execute(f"ALTER TABLE surveys ADD COLUMN {col} " + (
+                    "INTEGER" if col.startswith("bp") and "pulse" in col else "TEXT"
+                ))
+            except aiosqlite.OperationalError:
+                pass
         await db.commit()
         logger.info("База данных инициализирована")
 

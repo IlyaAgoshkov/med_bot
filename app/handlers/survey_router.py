@@ -118,6 +118,12 @@ async def send_gift_to_referrer(bot, user_id: int):
                             request_timeout=60  # Увеличиваем таймаут до 60 секунд
                         )
                         logger.info(f"✅ Подарок {preferred_gift} успешно отправлен рефереру {referrer_id}")
+                        # Отмечаем подарок как выданный в таблице referrals
+                        await db.execute(
+                            "UPDATE referrals SET gift_claimed = 1, gift_type = ? WHERE referrer_id = ? AND referred_id = ?",
+                            (preferred_gift, referrer_id, user_id)
+                        )
+                        await db.commit()
                         break  # Успешно отправлено, выходим из цикла
                     except Exception as retry_error:
                         if attempt < max_retries - 1:
@@ -334,18 +340,68 @@ async def cmd_start(message: Message, state: FSMContext):
     
     welcome_text = """👋 <b>Добро пожаловать!</b>
 
-<b>Бесплатный чек-ап артериального давления</b>
+Вы открыли цифровой чек-ап артериального давления, созданный в рамках научного проекта по раннему выявлению высокого нормального давления (предгипертонии).
 
-Данный опросник подходит для возрастной категории лиц от 15-45 лет.
+Это состояние, при котором давление ещё не требует лечения, но уже повышает риск развития гипертонии в будущем.
+По данным исследований, оно встречается у 30–40% взрослых, и большинство людей об этом не знают.
 
-<b>Знаете ли Вы, что такое предгипертония?</b> Это пограничное состояние, когда давление еще не требует лекарств, но уже сигнализирует: пора менять привычки. И оно есть у 30-40% взрослых людей, многие из которых об этом даже не догадываются.
+🩺 <b>Во время прохождения Вам предстоит:</b>
+• ответить на короткие вопросы о здоровье и образе жизни
+• 3 раза измерить артериальное давление и пульс
+• получить персональную оценку риска и рекомендации
 
-Это не диагноз, а повод задуматься о своем здоровье и получить удобный цифровой срез.
+⏱️ Время прохождения: ~5–7 минут.
 
-Помогите исследованию и проверьте себя! 👇"""
+Опросник предназначен для лиц 15–45 лет и используется в исследовательских целях.
+
+<b>Важно:</b> результат носит скрининговый характер, не является медицинским диагнозом и не заменяет консультацию врача.
+
+Ваше участие помогает развивать цифровые инструменты профилактики сердечно-сосудистых заболеваний ❤️
+
+Готовы проверить себя? Нажмите «Начать» 👇"""
     
     sent_message = await message.answer(welcome_text, reply_markup=get_start_keyboard())
     await state.update_data(main_message_id=sent_message.message_id)
+    await state.set_state(SurveyStates.welcome)
+
+
+# Чек-лист перед каждым измерением АД
+BP_CHECKLIST = """
+📋 <b>Перед измерением проверьте:</b>
+• Поза: сидя, спина и рука с опорой, манжета по размеру
+• Без кофе, курения и нагрузки за 30 минут
+• Покой не менее 5 минут перед измерением
+• Одна и та же рука при всех трёх измерениях
+• По возможности — автоматический тонометр (модель можно указать после ввода времени)
+"""
+
+# Второй экран приветствия (после «Начать»)
+PRE_SURVEY_TEXT = """Спасибо за готовность принять участие! 🙌
+
+Перед началом — несколько важных моментов:
+
+🩺 <b>Что Вас ждёт:</b>
+• короткий опрос о здоровье и образе жизни
+• трёхкратное измерение артериального давления и пульса
+• автоматический расчёт уровня риска
+
+⏱️ Время прохождения: ~5–7 минут.
+
+📌 <b>Важно:</b>
+• измерения выполняются самостоятельно
+• используйте автоматический тонометр (если есть)
+• результаты носят скрининговый характер и не являются диагнозом
+
+Все данные используются в обезличенном виде в научных целях.
+
+Если Вы готовы — нажмите «Начать опрос» 👇"""
+
+
+@router.callback_query(StateFilter(SurveyStates.welcome), F.data == "welcome_start")
+async def welcome_start(callback: CallbackQuery, state: FSMContext):
+    """Переход с первого экрана на второй (кнопка «Начать»)."""
+    await callback.answer()
+    await callback.message.answer(PRE_SURVEY_TEXT, reply_markup=get_main_menu_keyboard())
     await state.set_state(SurveyStates.main_menu)
 
 
@@ -402,20 +458,7 @@ async def invite_friend(callback: CallbackQuery, state: FSMContext):
 async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
-    
-    welcome_text = """👋 <b>Добро пожаловать!</b>
-
-<b>Бесплатный чек-ап артериального давления</b>
-
-Данный опросник подходит для возрастной категории лиц от 15-45 лет.
-
-<b>Знаете ли Вы, что такое предгипертония?</b> Это пограничное состояние, когда давление еще не требует лекарств, но уже сигнализирует: пора менять привычки. И оно есть у 30-40% взрослых людей, многие из которых об этом даже не догадываются.
-
-Это не диагноз, а повод задуматься о своем здоровье и получить удобный цифровой срез.
-
-Помогите исследованию и проверьте себя! 👇"""
-    
-    await callback.message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
+    await callback.message.answer(PRE_SURVEY_TEXT, reply_markup=get_main_menu_keyboard())
     await state.set_state(SurveyStates.main_menu)
 
 
@@ -440,12 +483,10 @@ async def process_consent(callback: CallbackQuery, state: FSMContext):
         pass
     
     instruction_text = """<b>2. Инструкция по измерению АД</b>
-
-Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
+""" + BP_CHECKLIST + """
 <b>Первое измерение АД</b>
-Введите значения АД (верхнее/нижнее).
-<b>Пример:</b> 120/80"""
+Введите значения АД (верхнее/нижнее) и пульс.
+<b>Пример:</b> 120/80 75"""
     
     await callback.message.answer(instruction_text)
     await state.set_state(SurveyStates.waiting_bp1_values)
@@ -457,23 +498,28 @@ async def process_consent(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(SurveyStates.waiting_bp1_values))
 async def process_bp1_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
-    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
+    # Парсим формат: 120/80 или 120/80 75 (АД и пульс)
+    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b> (АД и пульс) или <b>120/80</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
+    pulse = int(match.group(3)) if match.group(3) else None
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
+    if pulse is not None and not (30 <= pulse <= 200):
+        await message.answer("❌ Пульс должен быть в диапазоне 30–200. Введите снова или только АД (120/80).")
+        return
     
     await state.update_data(
         bp1_systolic=systolic,
-        bp1_diastolic=diastolic
+        bp1_diastolic=diastolic,
+        bp1_pulse=pulse
     )
     
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
@@ -492,6 +538,18 @@ async def process_bp1_time(message: Message, state: FSMContext):
     
     await state.update_data(bp1_time=time_text)
     
+    await message.answer(
+        "По возможности укажите модель тонометра (например: Omron M2). Если не хотите — напишите «нет» или «-»."
+    )
+    await state.set_state(SurveyStates.waiting_tonometer_model)
+
+
+@router.message(StateFilter(SurveyStates.waiting_tonometer_model))
+async def process_tonometer_model(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() in ("нет", "-", "—", "."):
+        text = ""
+    await state.update_data(tonometer_model=text or None)
     await message.answer("<b>3. Демография и антропометрия</b>\n\nСколько вам полных лет? (только цифры)")
     await state.set_state(SurveyStates.waiting_age)
 
@@ -748,12 +806,10 @@ async def process_night_shifts(callback: CallbackQuery, state: FSMContext):
         await state.update_data(night_shifts_rate="")
         # Переходим ко второму измерению АД
         instruction_text = """<b>5. Инструкция по измерению АД</b>
-
-Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
+""" + BP_CHECKLIST + """
 <b>Второе измерение АД</b>
-Введите значения АД (верхнее/нижнее).
-<b>Пример:</b> 120/80"""
+Введите значения АД (верхнее/нижнее) и пульс.
+<b>Пример:</b> 120/80 75"""
         await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp2_values)
 
@@ -779,12 +835,10 @@ async def process_night_shifts_rate(callback: CallbackQuery, state: FSMContext):
         pass
     
     instruction_text = """<b>5. Инструкция по измерению АД</b>
-
-Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
+""" + BP_CHECKLIST + """
 <b>Второе измерение АД</b>
-Введите значения АД (верхнее/нижнее).
-<b>Пример:</b> 120/80"""
+Введите значения АД (верхнее/нижнее) и пульс.
+<b>Пример:</b> 120/80 75"""
     await callback.message.answer(instruction_text)
     await state.set_state(SurveyStates.waiting_bp2_values)
 
@@ -793,23 +847,27 @@ async def process_night_shifts_rate(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(SurveyStates.waiting_bp2_values))
 async def process_bp2_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
-    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
+    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b> (АД и пульс) или <b>120/80</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
+    pulse = int(match.group(3)) if match.group(3) else None
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
+    if pulse is not None and not (30 <= pulse <= 200):
+        await message.answer("❌ Пульс должен быть в диапазоне 30–200. Введите снова или только АД (120/80).")
+        return
     
     await state.update_data(
         bp2_systolic=systolic,
-        bp2_diastolic=diastolic
+        bp2_diastolic=diastolic,
+        bp2_pulse=pulse
     )
     
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
@@ -833,6 +891,18 @@ async def process_bp2_time(message: Message, state: FSMContext):
 # Медицинская история
 @router.callback_query(StateFilter(SurveyStates.waiting_chronic_diseases), F.data.startswith("disease_"))
 async def process_chronic_diseases(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "disease_other":
+        await callback.answer()
+        try:
+            await callback.message.edit_text(
+                (callback.message.text or "") + "\n\n<b>Ваш ответ:</b> Другое",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+        await callback.message.answer("Напишите, какое именно хроническое заболевание у Вас есть:")
+        await state.set_state(SurveyStates.waiting_chronic_diseases_other)
+        return
     disease_map = {
         "disease_none": "нет",
         "disease_hypertension": "Артериальная гипертензия/гипертоническая болезнь",
@@ -844,17 +914,24 @@ async def process_chronic_diseases(callback: CallbackQuery, state: FSMContext):
     disease = disease_map[callback.data]
     await state.update_data(chronic_diseases=disease)
     await callback.answer()
-    
-    # Обновляем сообщение, добавляя выбранный ответ
     original_text = callback.message.text or ""
     updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {disease}"
-    
     try:
         await callback.message.edit_text(updated_text, reply_markup=None)
-    except:
+    except Exception:
         pass
-    
     await callback.message.answer("Принимаете ли Вы какие-либо лекарственные средства на постоянной основе?", reply_markup=get_yes_no_keyboard())
+    await state.set_state(SurveyStates.waiting_medications)
+
+
+@router.message(StateFilter(SurveyStates.waiting_chronic_diseases_other))
+async def process_chronic_diseases_other(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите название заболевания текстом.")
+        return
+    await state.update_data(chronic_diseases=text)
+    await message.answer("Принимаете ли Вы какие-либо лекарственные средства на постоянной основе?", reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_medications)
 
 
@@ -864,18 +941,38 @@ async def process_medications(callback: CallbackQuery, state: FSMContext):
     answer_text = "✅ Да" if callback.data == "yes" else "❌ Нет"
     await state.update_data(medications=medications)
     await callback.answer()
-    
-    # Обновляем сообщение, добавляя выбранный ответ
     original_text = callback.message.text or ""
     updated_text = f"{original_text}\n\n<b>Ваш ответ:</b> {answer_text}"
-    
     try:
         await callback.message.edit_text(updated_text, reply_markup=None)
-    except:
+    except Exception:
         pass
-    
-    await callback.message.answer("<b>7. Семейный анамнез</b>\n\nЕсть ли у ваших близких родственников (родители, братья/сестры/бабушки/дедушки) гипертония/инфаркт/инсульт?", reply_markup=get_yes_no_keyboard())
+    if callback.data == "yes":
+        await callback.message.answer("Укажите, какие именно препараты Вы принимаете (названия или группы):")
+        await state.set_state(SurveyStates.waiting_medications_list)
+    else:
+        await state.update_data(medications_text=None)
+        await _ask_family_history(callback.message, state)
+
+
+async def _ask_family_history(message_or_callback, state: FSMContext):
+    """Отправить вопрос о семейном анамнезе и перевести в состояние waiting_family_history."""
+    text = """<b>7. Семейный анамнез</b>
+
+Есть ли у ваших близких родственников (родители, братья/сестры, бабушки/дедушки) гипертония, инфаркт, инсульт или сахарный диабет?"""
+    if hasattr(message_or_callback, "answer"):
+        await message_or_callback.answer(text, reply_markup=get_yes_no_keyboard())
     await state.set_state(SurveyStates.waiting_family_history)
+
+
+@router.message(StateFilter(SurveyStates.waiting_medications_list))
+async def process_medications_list(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите названия препаратов.")
+        return
+    await state.update_data(medications_text=text)
+    await _ask_family_history(message, state)
 
 
 # Семейный анамнез
@@ -989,12 +1086,10 @@ async def process_phq2_q2(callback: CallbackQuery, state: FSMContext):
         await state.update_data(phq9_score=0)
         # Переходим к третьему измерению АД
         instruction_text = """<b>9. Инструкция по измерению АД</b>
-
-Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
+""" + BP_CHECKLIST + """
 <b>Третье измерение АД</b>
-Введите значения АД (верхнее/нижнее).
-<b>Пример:</b> 120/80"""
+Введите значения АД (верхнее/нижнее) и пульс.
+<b>Пример:</b> 120/80 75"""
         await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp3_values)
 
@@ -1048,12 +1143,10 @@ async def process_phq9(callback: CallbackQuery, state: FSMContext):
         await state.update_data(phq9_score=total_phq9)
         
         instruction_text = """<b>9. Инструкция по измерению АД</b>
-
-Пожалуйста, измерьте своё артериальное давление, используя тонометр. Сидите спокойно не менее 5 минут перед измерением.
-
+""" + BP_CHECKLIST + """
 <b>Третье измерение АД</b>
-Введите значения АД (верхнее/нижнее).
-<b>Пример:</b> 120/80"""
+Введите значения АД (верхнее/нижнее) и пульс.
+<b>Пример:</b> 120/80 75"""
         await callback.message.answer(instruction_text)
         await state.set_state(SurveyStates.waiting_bp3_values)
 
@@ -1062,23 +1155,27 @@ async def process_phq9(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(SurveyStates.waiting_bp3_values))
 async def process_bp3_values(message: Message, state: FSMContext):
     text = message.text.strip()
-    # Парсим формат: 120/80 или 120/80 75 (пульс игнорируется)
-    match = re.match(r'(\d+)/(\d+)(?:\s+\d+)?', text)
+    match = re.match(r'(\d+)/(\d+)(?:\s+(\d+))?', text)
     
     if not match:
-        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80</b> или <b>120/80 75</b>")
+        await message.answer("❌ Неверный формат. Введите в формате: <b>120/80 75</b> (АД и пульс) или <b>120/80</b>")
         return
     
     systolic = int(match.group(1))
     diastolic = int(match.group(2))
+    pulse = int(match.group(3)) if match.group(3) else None
     
     if not (50 <= systolic <= 250 and 30 <= diastolic <= 150):
         await message.answer("❌ Проверьте значения АД. Верхнее должно быть 50-250, нижнее 30-150.")
         return
+    if pulse is not None and not (30 <= pulse <= 200):
+        await message.answer("❌ Пульс должен быть в диапазоне 30–200. Введите снова или только АД (120/80).")
+        return
     
     await state.update_data(
         bp3_systolic=systolic,
-        bp3_diastolic=diastolic
+        bp3_diastolic=diastolic,
+        bp3_pulse=pulse
     )
     
     time_text = "⏰ Укажите время измерения.\n<b>Пример:</b> 12:00 или 09:02"
@@ -1224,13 +1321,13 @@ async def finish_survey(message: Message, state: FSMContext, user_id_override: i
             INSERT INTO surveys (
                 user_id, consent, age, gender, height, weight, bmi, education, financial_stability,
                 smoking, alcohol_per_week, salt_per_day, other_habits, screen_time, physical_activity,
-                night_shifts, night_shifts_rate, chronic_diseases, medications, family_history,
+                night_shifts, night_shifts_rate, chronic_diseases, medications, medications_text, family_history,
                 stress_level, sleep_quality, phq2_score, phq9_score,
-                bp1_systolic, bp1_diastolic, bp1_time,
-                bp2_systolic, bp2_diastolic, bp2_time,
-                bp3_systolic, bp3_diastolic, bp3_time,
-                referral_source, risk_level, risk_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                bp1_systolic, bp1_diastolic, bp1_pulse, bp1_time,
+                bp2_systolic, bp2_diastolic, bp2_pulse, bp2_time,
+                bp3_systolic, bp3_diastolic, bp3_pulse, bp3_time,
+                tonometer_model, referral_source, risk_level, risk_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id, data.get("consent"), data.get("age"), data.get("gender"),
             data.get("height"), data.get("weight"), data.get("bmi"),
@@ -1238,13 +1335,14 @@ async def finish_survey(message: Message, state: FSMContext, user_id_override: i
             data.get("smoking"), data.get("alcohol_per_week"), data.get("salt_per_day"),
             data.get("other_habits"), data.get("screen_time"), data.get("physical_activity"),
             data.get("night_shifts"), data.get("night_shifts_rate"),
-            data.get("chronic_diseases"), data.get("medications"), data.get("family_history"),
+            data.get("chronic_diseases"), data.get("medications"), data.get("medications_text"),
+            data.get("family_history"),
             data.get("stress_level"), data.get("sleep_quality"),
             data.get("phq2_score", 0), data.get("phq9_score", 0),
-            data.get("bp1_systolic"), data.get("bp1_diastolic"), data.get("bp1_time"),
-            data.get("bp2_systolic"), data.get("bp2_diastolic"), data.get("bp2_time"),
-            data.get("bp3_systolic"), data.get("bp3_diastolic"), data.get("bp3_time"),
-            data.get("referral_source"), risk_level, risk_score
+            data.get("bp1_systolic"), data.get("bp1_diastolic"), data.get("bp1_pulse"), data.get("bp1_time"),
+            data.get("bp2_systolic"), data.get("bp2_diastolic"), data.get("bp2_pulse"), data.get("bp2_time"),
+            data.get("bp3_systolic"), data.get("bp3_diastolic"), data.get("bp3_pulse"), data.get("bp3_time"),
+            data.get("tonometer_model"), data.get("referral_source"), risk_level, risk_score
         ))
         await db.commit()
     

@@ -2,6 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 from app.database.db import get_db_path
 from app.filters.admin_filter import IsAdminFilter
 from app.keyboards.inline_keyboards import get_admin_keyboard, get_gift_keyboard
@@ -10,6 +11,7 @@ import aiosqlite
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
+import asyncio
 import tempfile
 import os
 import logging
@@ -17,6 +19,16 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+def _excel_safe_value(value):
+    """Экранировать строки, начинающиеся с =, +, -, @, чтобы Excel не воспринимал их как формулу."""
+    if value is None or value == "":
+        return value
+    s = str(value).strip()
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + str(value)
+    return value
 
 
 @router.message(Command("admin"), IsAdminFilter())
@@ -64,7 +76,11 @@ async def admin_stats(callback: CallbackQuery):
 👥 Были приглашены: {users_referred}
 👥 Пригласили других: {users_referrers}"""
     
-    await callback.message.edit_text(stats_text, reply_markup=get_admin_keyboard())
+    try:
+        await callback.message.edit_text(stats_text, reply_markup=get_admin_keyboard())
+    except TelegramBadRequest as e:
+        if "message is not modified" not in (e.message or ""):
+            raise
     await callback.answer()
 
 
@@ -181,14 +197,19 @@ async def generate_excel_export() -> str:
         "АД1 систолическое",
         "АД1 диастолическое",
         "АД1 время",
+        "АД1 пульс",
         "АД2 систолическое",
         "АД2 диастолическое",
         "АД2 время",
+        "АД2 пульс",
         "АД3 систолическое",
         "АД3 диастолическое",
         "АД3 время",
+        "АД3 пульс",
         "Среднее АД систолическое",
         "Среднее АД диастолическое",
+        "Модель тонометра",
+        "Препараты (текст)",
         "Источник информации",
         "Балл риска",
         "Уровень риска",
@@ -201,30 +222,56 @@ async def generate_excel_export() -> str:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal='center', vertical='center')
     
-    # Получаем данные из БД
+    # Получаем данные из БД (с новыми полями: пульс, модель тонометра, препараты)
     async with aiosqlite.connect(get_db_path()) as db:
-        async with db.execute("""
-            SELECT 
-                id,
-                age, gender, height, weight, bmi,
-                education, financial_stability,
-                smoking, alcohol_per_week, salt_per_day, other_habits,
-                screen_time, physical_activity,
-                night_shifts, night_shifts_rate,
-                chronic_diseases, medications, family_history,
-                stress_level, sleep_quality,
-                phq2_score, phq9_score,
-                bp1_systolic, bp1_diastolic, bp1_time,
-                bp2_systolic, bp2_diastolic, bp2_time,
-                bp3_systolic, bp3_diastolic, bp3_time,
-                referral_source, risk_score, risk_level,
-                completed_at
-            FROM surveys
-            ORDER BY completed_at DESC
-        """) as cursor:
-            rows = await cursor.fetchall()
+        try:
+            async with db.execute("""
+                SELECT 
+                    id,
+                    age, gender, height, weight, bmi,
+                    education, financial_stability,
+                    smoking, alcohol_per_week, salt_per_day, other_habits,
+                    screen_time, physical_activity,
+                    night_shifts, night_shifts_rate,
+                    chronic_diseases, medications, family_history,
+                    stress_level, sleep_quality,
+                    phq2_score, phq9_score,
+                    bp1_systolic, bp1_diastolic, bp1_time, bp1_pulse,
+                    bp2_systolic, bp2_diastolic, bp2_time, bp2_pulse,
+                    bp3_systolic, bp3_diastolic, bp3_time, bp3_pulse,
+                    tonometer_model, medications_text,
+                    referral_source, risk_score, risk_level,
+                    completed_at
+                FROM surveys
+                ORDER BY completed_at DESC
+            """) as cursor:
+                rows = await cursor.fetchall()
+            has_new_columns = True
+        except aiosqlite.OperationalError:
+            # Старая БД без новых колонок — выгружаем без них
+            async with db.execute("""
+                SELECT 
+                    id,
+                    age, gender, height, weight, bmi,
+                    education, financial_stability,
+                    smoking, alcohol_per_week, salt_per_day, other_habits,
+                    screen_time, physical_activity,
+                    night_shifts, night_shifts_rate,
+                    chronic_diseases, medications, family_history,
+                    stress_level, sleep_quality,
+                    phq2_score, phq9_score,
+                    bp1_systolic, bp1_diastolic, bp1_time,
+                    bp2_systolic, bp2_diastolic, bp2_time,
+                    bp3_systolic, bp3_diastolic, bp3_time,
+                    referral_source, risk_score, risk_level,
+                    completed_at
+                FROM surveys
+                ORDER BY completed_at DESC
+            """) as cursor:
+                rows = await cursor.fetchall()
+            has_new_columns = False
     
-    logger.info(f"Получено {len(rows)} записей из базы данных")
+    logger.info(f"Получено {len(rows)} записей из базы данных (новые колонки: {has_new_columns})")
     
     # Записываем данные
     if not rows:
@@ -233,62 +280,54 @@ async def generate_excel_export() -> str:
         return temp_file.name
     
     for row_idx, row in enumerate(rows, 2):
-        # Вычисляем среднее АД (индексы: 23=bp1_sys, 24=bp1_dia, 26=bp2_sys, 27=bp2_dia, 29=bp3_sys, 30=bp3_dia)
-        bp1_sys, bp1_dia = row[23], row[24]
-        bp2_sys, bp2_dia = row[26], row[27]
-        bp3_sys, bp3_dia = row[29], row[30]
-        
-        avg_sys = None
-        avg_dia = None
-        if bp1_sys and bp2_sys and bp3_sys:
-            avg_sys = (bp1_sys + bp2_sys + bp3_sys) // 3
-        if bp1_dia and bp2_dia and bp3_dia:
-            avg_dia = (bp1_dia + bp2_dia + bp3_dia) // 3
-        
-        # Формируем строку данных
-        data_row = [
-            row[0],  # ID опроса
-            row[1] if row[1] else "",  # Возраст
-            row[2] if row[2] else "",  # Пол
-            row[3] if row[3] else "",  # Рост
-            row[4] if row[4] else "",  # Вес
-            round(row[5], 2) if row[5] else "",  # ИМТ
-            row[6] if row[6] else "",  # Образование
-            row[7] if row[7] else "",  # Финансовая стабильность
-            "Да" if row[8] else "Нет",  # Курение
-            row[9] if row[9] is not None else 0,  # Алкоголь
-            round(row[10], 1) if row[10] else "",  # Соль
-            "Да" if row[11] else "Нет",  # Другие привычки
-            row[12] if row[12] else "",  # Время за экраном
-            "Да" if row[13] else "Нет",  # Физическая активность
-            "Да" if row[14] else "Нет",  # Ночные дежурства
-            row[15] if row[15] else "",  # Ставка
-            row[16] if row[16] else "",  # Хронические заболевания
-            "Да" if row[17] else "Нет",  # Лекарства
-            "Да" if row[18] else "Нет",  # Семейный анамнез
-            row[19] if row[19] else "",  # Стресс
-            row[20] if row[20] else "",  # Сон
-            row[21] if row[21] else 0,  # PHQ-2
-            row[22] if row[22] else 0,  # PHQ-9
-            row[23] if row[23] else "",  # АД1 сист
-            row[24] if row[24] else "",  # АД1 диаст
-            row[25] if row[25] else "",  # АД1 время
-            row[26] if row[26] else "",  # АД2 сист
-            row[27] if row[27] else "",  # АД2 диаст
-            row[28] if row[28] else "",  # АД2 время
-            row[29] if row[29] else "",  # АД3 сист
-            row[30] if row[30] else "",  # АД3 диаст
-            row[31] if row[31] else "",  # АД3 время
-            avg_sys if avg_sys else "",  # Среднее АД сист
-            avg_dia if avg_dia else "",  # Среднее АД диаст
-            row[32] if row[32] else "",  # Источник
-            row[33] if row[33] else "",  # Балл риска
-            row[34] if row[34] else "",  # Уровень риска
-            row[35] if row[35] else ""  # Дата
-        ]
+        if has_new_columns:
+            # Индексы с новыми колонками: 23=bp1_sys ... 26=bp1_pulse, 27=bp2_sys ... 35=tonometer, 36=medications_text, 37=referral...
+            bp1_sys, bp1_dia = row[23], row[24]
+            bp2_sys, bp2_dia = row[27], row[28]
+            bp3_sys, bp3_dia = row[31], row[32]
+            avg_sys = (bp1_sys + bp2_sys + bp3_sys) // 3 if (bp1_sys and bp2_sys and bp3_sys) else None
+            avg_dia = (bp1_dia + bp2_dia + bp3_dia) // 3 if (bp1_dia and bp2_dia and bp3_dia) else None
+            data_row = [
+                row[0], row[1] if row[1] else "", row[2] if row[2] else "", row[3] if row[3] else "", row[4] if row[4] else "",
+                round(row[5], 2) if row[5] else "", row[6] if row[6] else "", row[7] if row[7] else "",
+                "Да" if row[8] else "Нет", row[9] if row[9] is not None else 0, round(row[10], 1) if row[10] else "",
+                "Да" if row[11] else "Нет", row[12] if row[12] else "", "Да" if row[13] else "Нет", "Да" if row[14] else "Нет",
+                row[15] if row[15] else "", row[16] if row[16] else "", "Да" if row[17] else "Нет", "Да" if row[18] else "Нет",
+                row[19] if row[19] else "", row[20] if row[20] else "", row[21] if row[21] else 0, row[22] if row[22] else 0,
+                row[23] if row[23] else "", row[24] if row[24] else "", row[25] if row[25] else "", row[26] if row[26] else "",
+                row[27] if row[27] else "", row[28] if row[28] else "", row[29] if row[29] else "", row[30] if row[30] else "",
+                row[31] if row[31] else "", row[32] if row[32] else "", row[33] if row[33] else "", row[34] if row[34] else "",
+                avg_sys if avg_sys else "", avg_dia if avg_dia else "",
+                row[35] if row[35] else "", row[36] if row[36] else "",
+                row[37] if row[37] else "", row[38] if row[38] else "", row[39] if row[39] else "", row[40] if row[40] else ""
+            ]
+        else:
+            # Без новых колонок: bp1_time=25, bp2_sys=26, bp2_time=28, bp3_sys=29, bp3_time=31, referral=32, risk_score=33, risk_level=34, date=35
+            bp1_sys, bp1_dia = row[23], row[24]
+            bp2_sys, bp2_dia = row[26], row[27]
+            bp3_sys, bp3_dia = row[29], row[30]
+            avg_sys = (bp1_sys + bp2_sys + bp3_sys) // 3 if (bp1_sys and bp2_sys and bp3_sys) else None
+            avg_dia = (bp1_dia + bp2_dia + bp3_dia) // 3 if (bp1_dia and bp2_dia and bp3_dia) else None
+            data_row = [
+                row[0], row[1] if row[1] else "", row[2] if row[2] else "", row[3] if row[3] else "", row[4] if row[4] else "",
+                round(row[5], 2) if row[5] else "", row[6] if row[6] else "", row[7] if row[7] else "",
+                "Да" if row[8] else "Нет", row[9] if row[9] is not None else 0, round(row[10], 1) if row[10] else "",
+                "Да" if row[11] else "Нет", row[12] if row[12] else "", "Да" if row[13] else "Нет", "Да" if row[14] else "Нет",
+                row[15] if row[15] else "", row[16] if row[16] else "", "Да" if row[17] else "Нет", "Да" if row[18] else "Нет",
+                row[19] if row[19] else "", row[20] if row[20] else "", row[21] if row[21] else 0, row[22] if row[22] else 0,
+                row[23] if row[23] else "", row[24] if row[24] else "", row[25] if row[25] else "",
+                "",  # АД1 пульс
+                row[26] if row[26] else "", row[27] if row[27] else "", row[28] if row[28] else "",
+                "",  # АД2 пульс
+                row[29] if row[29] else "", row[30] if row[30] else "", row[31] if row[31] else "",
+                "",  # АД3 пульс
+                avg_sys if avg_sys else "", avg_dia if avg_dia else "",
+                "", "",  # Модель тонометра, Препараты (текст)
+                row[32] if row[32] else "", row[33] if row[33] else "", row[34] if row[34] else "", row[35] if row[35] else ""
+            ]
         
         for col, value in enumerate(data_row, 1):
-            ws.cell(row=row_idx, column=col, value=value)
+            ws.cell(row=row_idx, column=col, value=_excel_safe_value(value))
     
     # Настраиваем ширину колонок
     for col in range(1, len(headers) + 1):
@@ -354,6 +393,43 @@ async def admin_export(callback: CallbackQuery):
     except Exception as e:
             await callback.answer("❌ Ошибка при генерации файла", show_alert=True)
             logger.error(f"Ошибка при генерации Excel файла: {e}", exc_info=True)
+
+
+@router.message(Command("send_unclaimed_gifts"), IsAdminFilter())
+async def cmd_send_unclaimed_gifts(message: Message):
+    """Отправить подарки всем реферерам, чьи приглашённые прошли тест, но подарок ещё не был выдан."""
+    from app.handlers.survey_router import send_gift_to_referrer
+    status = await message.answer("⏳ Ищу невыданные подарки...")
+    sent = 0
+    errors = 0
+    async with aiosqlite.connect(get_db_path()) as db:
+        async with db.execute("""
+            SELECT r.referrer_id, r.referred_id
+            FROM referrals r
+            INNER JOIN surveys s ON s.user_id = r.referred_id
+            WHERE r.gift_claimed = 0
+            ORDER BY r.referrer_id, r.referred_id
+        """) as cursor:
+            rows = await cursor.fetchall()
+    for referrer_id, referred_id in rows:
+        try:
+            await send_gift_to_referrer(message.bot, referred_id)
+            sent += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.exception(f"Ошибка отправки подарка рефереру {referrer_id} за referred_id {referred_id}")
+            errors += 1
+    try:
+        await status.edit_text(
+            f"✅ <b>Готово</b>\n\n"
+            f"Обработано записей: {len(rows)}\n"
+            f"Подарков отправлено: {sent}\n"
+            f"Ошибок: {errors}"
+        )
+    except Exception:
+        await message.answer(
+            f"✅ Обработано: {len(rows)}, отправлено: {sent}, ошибок: {errors}"
+        )
 
 
 @router.message(Command("test_gift"), IsAdminFilter())
@@ -475,19 +551,19 @@ async def cmd_test_complete(message: Message):
                     user_id, consent, age, gender, height, weight, bmi, 
                     education, financial_stability, smoking, alcohol_per_week, 
                     salt_per_day, other_habits, screen_time, physical_activity,
-                    night_shifts, night_shifts_rate, chronic_diseases, medications, 
+                    night_shifts, night_shifts_rate, chronic_diseases, medications, medications_text,
                     family_history, stress_level, sleep_quality, phq2_score, phq9_score,
-                    bp1_systolic, bp1_diastolic, bp1_time,
-                    bp2_systolic, bp2_diastolic, bp2_time,
-                    bp3_systolic, bp3_diastolic, bp3_time,
-                    referral_source, risk_level, risk_score
+                    bp1_systolic, bp1_diastolic, bp1_pulse, bp1_time,
+                    bp2_systolic, bp2_diastolic, bp2_pulse, bp2_time,
+                    bp3_systolic, bp3_diastolic, bp3_pulse, bp3_time,
+                    tonometer_model, referral_source, risk_level, risk_score
                 ) VALUES (?, 1, 30, 'мужской', 175, 75, 24.5, 
                     'Высшее', 'Средняя', 0, 0, 5.0, 0, 4, 1,
-                    0, NULL, 'нет', 0, 0, 5, 7, 0, 0,
-                    120, 80, '12:00',
-                    125, 82, '16:00',
-                    118, 78, '20:00',
-                    'Другое', 'низкий', 5)
+                    0, NULL, 'нет', 0, NULL, 0, 5, 7, 0, 0,
+                    120, 80, 72, '12:00',
+                    125, 82, 75, '16:00',
+                    118, 78, 70, '20:00',
+                    NULL, 'Другое', 'низкий', 5)
             """, (user_id,))
             await db.commit()
             await message.answer("✅ Создана запись о прохождении теста (тестовые данные)")

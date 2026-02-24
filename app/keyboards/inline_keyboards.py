@@ -58,7 +58,8 @@ def get_chronic_diseases_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Сахарный диабет", callback_data="disease_diabetes")],
         [InlineKeyboardButton(text="Инфаркт/Инсульт", callback_data="disease_heart")],
         [InlineKeyboardButton(text="Гипертиреоз/Гипотиреоз", callback_data="disease_thyroid")],
-        [InlineKeyboardButton(text="Хроническая болезнь почек", callback_data="disease_kidney")]
+        [InlineKeyboardButton(text="Хроническая болезнь почек", callback_data="disease_kidney")],
+        [InlineKeyboardButton(text="Другое (напишу сам/а)", callback_data="disease_other")]
     ])
     return keyboard
 
@@ -104,18 +105,17 @@ def get_invite_friend_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню бота"""
+    """Главное меню бота (второй экран — перед опросом)"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Пройти тестирование", callback_data="start_survey")],
-        [InlineKeyboardButton(text="👥 Пригласить друга", callback_data="invite_friend")]
+        [InlineKeyboardButton(text="📋 Начать опрос", callback_data="start_survey")]
     ])
     return keyboard
 
 
 def get_start_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для стартового сообщения (только кнопка Пройти тестирование)"""
+    """Клавиатура для стартового сообщения (кнопка «Начать»)"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Пройти тестирование", callback_data="start_survey")]
+        [InlineKeyboardButton(text="Начать", callback_data="welcome_start")]
     ])
     return keyboard
 

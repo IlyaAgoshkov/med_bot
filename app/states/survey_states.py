@@ -2,7 +2,9 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class SurveyStates(StatesGroup):
-    # Главное меню
+    # Первый экран приветствия (кнопка «Начать»)
+    welcome = State()
+    # Главное меню (второй экран — перед опросом)
     main_menu = State()
     # Начало опроса
     waiting_consent = State()
@@ -11,6 +13,7 @@ class SurveyStates(StatesGroup):
     waiting_bp1_instruction = State()
     waiting_bp1_values = State()
     waiting_bp1_time = State()
+    waiting_tonometer_model = State()
     
     # Демография
     waiting_age = State()
@@ -37,7 +40,9 @@ class SurveyStates(StatesGroup):
     
     # Медицинская история
     waiting_chronic_diseases = State()
+    waiting_chronic_diseases_other = State()
     waiting_medications = State()
+    waiting_medications_list = State()
     
     # Семейный анамнез
     waiting_family_history = State()
